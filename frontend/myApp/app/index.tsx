@@ -5,16 +5,19 @@ import {
   TouchableOpacity,
   View,
   ScrollView,
-  Alert
+  Alert,
+  Text
 } from 'react-native';
 import * as ImagePicker from 'expo-image-picker';
 import { Image } from 'expo-image';
+import { Video } from 'expo-av';
 
 import { ThemedView } from '@/components/themed-view';
 import { ThemedText } from '@/components/themed-text';
 
 export default function HomeScreen() {
   const [imageUri, setImageUri] = useState<string | null>(null);
+  const [videoUri, setVideoUri] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
   const [result, setResult] = useState<any | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -39,6 +42,26 @@ export default function HomeScreen() {
     }
   };
 
+  /* Pick video from gallery */
+  const pickVideo = async () => {
+    const permission = await ImagePicker.requestMediaLibraryPermissionsAsync();
+    if (!permission.granted) {
+      setError('Media library permission is required');
+      return;
+    }
+
+    const res = await ImagePicker.launchImageLibraryAsync({
+      mediaTypes: ImagePicker.MediaTypeOptions.Videos,
+      quality: 1,
+    });
+
+    if (!res.canceled) {
+      setVideoUri(res.assets[0].uri);
+      setResult(null);
+      setError(null);
+    }
+  };
+
   /* Take Photo */
   const takePhoto = async () => {
     const permission = await ImagePicker.requestCameraPermissionsAsync();
@@ -58,11 +81,38 @@ export default function HomeScreen() {
     }
   };
 
+  const recordVideo = async () => {
+    const permission = await ImagePicker.requestCameraPermissionsAsync();
+    if (!permission.granted) {
+      setError('Camera permission is required');
+      return;
+    }
+
+    const res = await ImagePicker.launchCameraAsync({
+      mediaTypes: ImagePicker.MediaTypeOptions.Videos,
+      quality: 1,
+    });
+
+    if (!res.canceled) {
+      setVideoUri(res.assets[0].uri);
+      setResult(null);
+      setError(null);
+    }
+  };
+
   /* ------------------ Source Selector ------------------ */
   const chooseImageSource = () => {
     Alert.alert('Select Image Source', '', [
       { text: 'Camera', onPress: takePhoto },
       { text: 'Gallery', onPress: pickImage },
+      { text: 'Cancel', style: 'cancel' },
+    ]);
+  };
+
+  const chooseVideoSource = () => {
+    Alert.alert('Select Video Source', '', [
+      { text: 'Camera', onPress: recordVideo },
+      { text: 'Gallery', onPress: pickVideo },
       { text: 'Cancel', style: 'cancel' },
     ]);
   };
@@ -94,6 +144,43 @@ export default function HomeScreen() {
 
       const data = await response.json();
       setResult(data);
+      console.log(data);
+    } catch (err) {
+      setError('Upload failed. Please check server or network.');
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  /* Upload video */
+  const uploadVideo = async () => {
+    if (!videoUri || loading) return;
+
+    setLoading(true);
+    setResult(null);
+    setError(null);
+
+    const formData = new FormData();
+    formData.append('file', {
+      uri: videoUri,
+      name: 'video.mp4',
+      type: 'video/mp4',
+    } as any);
+
+    try {
+      const response = await fetch('http://192.168.68.55:8000/track-human-video', {
+        method: 'POST',
+        body: formData,
+        headers: {
+          'Content-Type': 'multipart/form-data',
+        },
+      });
+
+      if (!response.ok) throw new Error('Server error');
+
+      const data = await response.json();
+      setResult(data);
+      console.log(data);
     } catch (err) {
       setError('Upload failed. Please check server or network.');
     } finally {
@@ -109,6 +196,43 @@ export default function HomeScreen() {
         </ThemedText>
 
         <ThemedText style={styles.subtitle}>
+          Record or select a video to detect humans
+        </ThemedText>
+
+        {/* Video Selector */}
+        <TouchableOpacity
+          style={styles.videoCard}
+          onPress={chooseVideoSource}
+          activeOpacity={0.85}
+        >
+          {videoUri ? (
+            <Video
+              source={{ uri: videoUri }}
+              style={styles.video}
+              useNativeControls
+              isLooping
+            />
+          ) : (
+            <ThemedText style={styles.placeholderText}>
+              Tap to choose video
+            </ThemedText>
+          )}
+        </TouchableOpacity>
+
+        {/* Upload Button */}
+        <TouchableOpacity
+          style={[styles.uploadButton, (!videoUri || loading) && styles.disabledButton]}
+          onPress={uploadVideo}
+          disabled={!videoUri || loading}
+        >
+          {loading ? (
+            <ActivityIndicator color="#fff" />
+          ) : (
+            <ThemedText style={styles.uploadText}>Upload</ThemedText>
+          )}
+        </TouchableOpacity>
+
+        <ThemedText type="subtitle" style={styles.subtitle}>
           Capture or Select an image to detect humans
         </ThemedText>
 
@@ -231,6 +355,16 @@ const styles = StyleSheet.create({
     justifyContent: 'center',
     alignItems: 'center',
   },
+  videoCard: {
+    height: 260,
+    borderRadius: 16,
+    backgroundColor: '#E5E7EB',
+    justifyContent: 'center',
+    alignItems: 'center',
+    marginBottom: 20,
+    overflow: 'hidden',
+  },
+  video: { width: '100%', height: '100%' },
   disabledButton: {
     backgroundColor: '#9CA3AF',
   },
@@ -285,3 +419,4 @@ const styles = StyleSheet.create({
   },
 
 });
+

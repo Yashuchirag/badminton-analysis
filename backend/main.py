@@ -2,6 +2,8 @@ from fastapi import FastAPI, UploadFile, File
 import cv2
 from ultralytics import YOLO
 import numpy as np
+import tempfile
+import os
 
 app = FastAPI()
 
@@ -46,4 +48,55 @@ async def track_human(file: UploadFile = File(...)):
         "status": "success",
         "humans_detected": person_count,
         "boxes": detections
+    }
+
+@app.post("/track-human-video")
+async def track_human_video(file: UploadFile = File(...)):
+    # Read image bytes
+    contents = await file.read()
+
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".mp4") as tmp:
+        tmp.write(contents)
+        video_path = tmp.name
+
+    cap = cv2.VideoCapture(video_path)
+
+    if not cap.isOpened():
+        return {"error": "Could not open video"}
+
+    frame_idx = 0
+    max_people = 0
+    frame_stats = []
+
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            break
+
+        frame_idx += 1
+
+        results = model(frame, conf=0.4, iou=0.5)
+        people_count = 0
+
+        for r in results:
+            for box in r.boxes:
+                cls_id = int(box.cls[0])
+                if cls_id == 0:  # person
+                    people_count += 1
+
+        max_people = max(max_people, people_count)
+
+        frame_stats.append({
+            "frame": frame_idx,
+            "humans_detected": people_count
+        })
+
+    cap.release()
+    os.remove(video_path)
+
+    return {
+        "status": "success",
+        "total_frames": frame_idx,
+        "max_humans_in_video": max_people,
+        "per_frame_stats": frame_stats
     }
