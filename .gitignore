@@ -1,0 +1,54 @@
+# Node dependencies
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Expo
+.expo/
+.expo-shared/
+
+# Build outputs
+dist/
+build/
+ios/Pods/
+android/.gradle/
+android/app/build/
+android/build/
+*.keystore
+*.apk
+*.aab
+*.ipa
+
+# TypeScript
+*.tsbuildinfo
+
+# VS Code
+.vscode/
+
+# macOS
+.DS_Store
+
+# Logs
+logs/
+*.log
+
+# Environment variables
+.env
+.env.local
+.env.*.local
+
+# JetBrains IDEs
+.idea/
+
+# Temporary files
+*.tmp
+*.temp
+
+# Python backend (if you integrate FastAPI for video scoring)
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.env/
+venv/
