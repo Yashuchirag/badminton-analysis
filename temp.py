@@ -1,2 +1,0 @@
-def temp:
-    return null
