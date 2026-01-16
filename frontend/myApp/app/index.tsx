@@ -232,11 +232,13 @@ export default function HomeScreen() {
           )}
         </TouchableOpacity>
 
+        {/* 
+        
         <ThemedText type="subtitle" style={styles.subtitle}>
           Capture or Select an image to detect humans
         </ThemedText>
 
-        {/* Image Selector */}
+        
         <TouchableOpacity
           style={styles.imageCard}
           onPress={chooseImageSource}
@@ -255,7 +257,6 @@ export default function HomeScreen() {
           )}
         </TouchableOpacity>
 
-        {/* Upload Button */}
         <TouchableOpacity
           style={[
             styles.uploadButton,
@@ -271,7 +272,8 @@ export default function HomeScreen() {
               Upload
             </ThemedText>
           )}
-        </TouchableOpacity>
+        </TouchableOpacity> 
+        */}
 
         {/* Error */}
         {error && (

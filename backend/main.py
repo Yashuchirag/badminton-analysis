@@ -67,6 +67,7 @@ async def track_human_video(file: UploadFile = File(...)):
     frame_idx = 0
     max_people = 0
     frame_stats = []
+    unique_ids = set()
 
     while True:
         ret, frame = cap.read()
@@ -76,8 +77,25 @@ async def track_human_video(file: UploadFile = File(...)):
         frame_idx += 1
 
         results = model(frame, conf=0.4, iou=0.5)
+        results1 = model.track(
+            frame,
+            persist=True,
+            conf=0.4,
+            iou=0.5,
+            tracker="bytetrack.yaml"
+        )
         people_count = 0
 
+        annotated_frame = results1[0].plot()
+        cv2.imshow("YOLO Detection", annotated_frame)
+        cv2.waitKey(1)
+
+
+        for r in results1:
+            if r.boxes.id is not None:
+                for track_id, cls_id in zip(r.boxes.id, r.boxes.cls):
+                    if int(cls_id) == 0:
+                        unique_ids.add(int(track_id))
         for r in results:
             for box in r.boxes:
                 cls_id = int(box.cls[0])
@@ -88,7 +106,8 @@ async def track_human_video(file: UploadFile = File(...)):
 
         frame_stats.append({
             "frame": frame_idx,
-            "humans_detected": people_count
+            "humans_detected": people_count,
+            "unique_ids": unique_ids
         })
 
     cap.release()
@@ -98,5 +117,7 @@ async def track_human_video(file: UploadFile = File(...)):
         "status": "success",
         "total_frames": frame_idx,
         "max_humans_in_video": max_people,
-        "per_frame_stats": frame_stats
+        "max_unique_ids": max(unique_ids),
+        "unique_ids": unique_ids,
+        #   "per_frame_stats": frame_stats
     }
