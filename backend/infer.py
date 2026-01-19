@@ -6,7 +6,7 @@ from train.model_tracknet import TrackNet
 # -------------------------
 # CONFIG
 # -------------------------
-INPUT_W, INPUT_H = 512, 288
+INPUT_W, INPUT_H = 960, 540
 HEATMAP_THRESH = 0.4
 
 
