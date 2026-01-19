@@ -19,8 +19,8 @@ def main_train():
     ANNOTATION_FILE = "annotations.json"
     INPUT_W, INPUT_H = 960, 540
     HEATMAP_SIGMA = 3
-    BATCH_SIZE = 8
-    EPOCHS = 50
+    BATCH_SIZE = 2
+    EPOCHS = 15
     LR = 1e-4
     VAL_SPLIT = 0.2
     MODEL_PATH = "tracknet.pth"
@@ -62,8 +62,8 @@ def main_train():
     train_len = len(dataset) - val_len
     train_ds, val_ds = random_split(dataset, [train_len, val_len])
 
-    train_loader = DataLoader(train_ds, BATCH_SIZE, shuffle=True, num_workers=4)
-    val_loader = DataLoader(val_ds, BATCH_SIZE, shuffle=False, num_workers=4)
+    train_loader = DataLoader(train_ds, BATCH_SIZE, shuffle=True, num_workers=0)
+    val_loader = DataLoader(val_ds, BATCH_SIZE, shuffle=False, num_workers=0)
     print("Data loaders created")
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print("Device: ", device)
