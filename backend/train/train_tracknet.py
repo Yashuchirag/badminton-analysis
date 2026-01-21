@@ -8,7 +8,7 @@ def train_tracknet(
     labels,
     dataset_class,
     batch_size=4,
-    epochs=50,
+    epochs=15,
     lr=1e-4,
     save_path="tracknet.pth",
     device=None

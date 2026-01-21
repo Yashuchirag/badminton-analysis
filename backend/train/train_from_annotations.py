@@ -20,7 +20,7 @@ def main_train():
     INPUT_W, INPUT_H = 960, 540
     HEATMAP_SIGMA = 3
     BATCH_SIZE = 2
-    EPOCHS = 15
+    EPOCHS = 10
     LR = 1e-4
     VAL_SPLIT = 0.2
     MODEL_PATH = "tracknet.pth"
@@ -45,7 +45,7 @@ def main_train():
             x, y = ann[k]
             indices.append(idx)
             heatmaps.append(
-                generate_heatmap(x, y, INPUT_W, INPUT_H, HEATMAP_SIGMA)
+                generate_heatmap(x, y, INPUT_H, INPUT_W, HEATMAP_SIGMA)
             )
 
     heatmaps = np.array(heatmaps, dtype=np.float32)
@@ -81,8 +81,9 @@ def main_train():
     for epoch in range(EPOCHS):
         model.train()
         train_loss = 0
-
+        print(f"Epoch {epoch+1}/{EPOCHS}")
         for x, y in train_loader:
+            print(f"Batch size: {x.shape[0]}")
             x, y = x.to(device), y.to(device)
 
             pred = model(x)
@@ -93,6 +94,7 @@ def main_train():
             optimizer.step()
 
             train_loss += loss.item()
+            print(f"Train loss: {loss.item():.4f}")
 
         train_loss /= len(train_loader)
 

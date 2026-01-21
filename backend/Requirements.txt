@@ -1,8 +1,21 @@
-fastapi
-uvicorn
-python-multipart
-opencv-python
-numpy
+# Core backend
+fastapi==0.110.0
+uvicorn[standard]==0.27.1
+
+# Multipart upload support
+python-multipart==0.0.9
+
+# PyTorch with CUDA (installed separately via index-url) updated manually
+
+
+# YOLO / Ultralytics
+ultralytics==8.1.12
+
+# Computer Vision
+opencv-python==4.9.0.80
+numpy==1.26.4
 pandas
-ultralytics
-torch
+
+# Utilities
+tqdm==4.66.2
+pillow==10.2.0
