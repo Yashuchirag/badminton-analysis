@@ -1,5 +1,7 @@
 import cv2
 import torch
+import base64
+import os
 import numpy as np
 from pathlib import Path
 
@@ -13,7 +15,7 @@ HEATMAP_THRESH = 0.4
 OUTPUT_DIR = Path("outputs")
 OUTPUT_DIR.mkdir(exist_ok=True)
 
-def shuttle_tracking_combined(cap, model, pose_model, tracknet, device, video_filename="output"):
+async def shuttle_tracking_combined(cap, model, pose_model, tracknet, device, video_filename="output"):
     """Process shuttle + human tracking in single pass"""
     
     
@@ -22,6 +24,7 @@ def shuttle_tracking_combined(cap, model, pose_model, tracknet, device, video_fi
     fps = int(cap.get(cv2.CAP_PROP_FPS))
     width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
 
     output_path = OUTPUT_DIR / f"{video_filename}_annotated.mp4"
 
@@ -29,8 +32,18 @@ def shuttle_tracking_combined(cap, model, pose_model, tracknet, device, video_fi
     out = cv2.VideoWriter(str(output_path), fourcc, fps, (width, height))
     
     if not out.isOpened():
-        print("Error: Could not open video writer")
-        return None, None, None, None
+        yield {
+            "type": "error",
+            "message": "Could not open video writer"
+        }
+        return
+    
+    yield {
+        "type": "started",
+        "total_frames": total_frames,
+        "fps": fps,
+        "resolution": {"width": width, "height": height}
+    }
     
     frame_buffer = []
     shuttle_positions = []
@@ -64,6 +77,7 @@ def shuttle_tracking_combined(cap, model, pose_model, tracknet, device, video_fi
         # Draw YOLO detections
         vis_frame = results[0].plot()
         
+        frame_wrists = []
         # Process and draw wrists
         for r in pose_results:
             if r.keypoints is None:
@@ -74,6 +88,11 @@ def shuttle_tracking_combined(cap, model, pose_model, tracknet, device, video_fi
                 
                 wrist_data.append({
                     "frame": frame_idx,
+                    "left_wrist": {"x": float(left_wrist[0]), "y": float(left_wrist[1])},
+                    "right_wrist": {"x": float(right_wrist[0]), "y": float(right_wrist[1])}
+                })
+
+                frame_wrists.append({
                     "left_wrist": {"x": float(left_wrist[0]), "y": float(left_wrist[1])},
                     "right_wrist": {"x": float(right_wrist[0]), "y": float(right_wrist[1])}
                 })
@@ -151,22 +170,76 @@ def shuttle_tracking_combined(cap, model, pose_model, tracknet, device, video_fi
         cv2.putText(vis_frame, f"People: {len(unique_ids)}", (10, 60),
                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
         
+        bar_width = 300
+        bar_height = 20
+        bar_x = width - bar_width - 20
+        bar_y = 20
+        progress = frame_idx / total_frames
+        cv2.rectangle(vis_frame, (bar_x, bar_y), (bar_x + bar_width, bar_y + bar_height), (50, 50, 50), -1)
+        cv2.rectangle(vis_frame, (bar_x, bar_y), (bar_x + int(bar_width * progress), bar_y + bar_height), (0, 255, 0), -1)
+        cv2.rectangle(vis_frame, (bar_x, bar_y), (bar_x + bar_width, bar_y + bar_height), (255, 255, 255), 2)
+        
+        cv2.rectangle(vis_frame, (width - 200, height - 140), (width - 10, height - 10), (0, 0, 0), -1)
+        cv2.rectangle(vis_frame, (width - 200, height - 140), (width - 10, height - 10), (255, 255, 255), 2)
+        
+        legend_x = width - 190
+        legend_y = height - 125
+        cv2.putText(vis_frame, "Legend:", (legend_x, legend_y),
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+        cv2.circle(vis_frame, (legend_x + 10, legend_y + 20), 5, (0, 255, 0), -1)
+        cv2.putText(vis_frame, "Left Wrist", (legend_x + 25, legend_y + 25),
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
+        cv2.circle(vis_frame, (legend_x + 10, legend_y + 40), 5, (255, 0, 0), -1)
+        cv2.putText(vis_frame, "Right Wrist", (legend_x + 25, legend_y + 45),
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
+        cv2.circle(vis_frame, (legend_x + 10, legend_y + 60), 5, (0, 255, 255), -1)
+        cv2.putText(vis_frame, "Shuttle", (legend_x + 25, legend_y + 65),
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
+        cv2.line(vis_frame, (legend_x + 5, legend_y + 80), (legend_x + 15, legend_y + 80), (0, 255, 255), 2)
+        cv2.putText(vis_frame, "Trail", (legend_x + 25, legend_y + 85),
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
+        
         # Track unique IDs
+        frame_people = 0
         for r in results:
             if r.boxes.id is not None:
                 for track_id, cls_id in zip(r.boxes.id, r.boxes.cls):
                     if int(cls_id) == 0:
                         unique_ids.add(int(track_id))
+                        frame_people += 1
         
-        # Write frame to output video
+        # Write frame to video
         out.write(vis_frame)
-    
+
+        if frame_idx % 5 == 0:
+            # Resize frame for streaming (smaller size)
+            preview_frame = cv2.resize(vis_frame, (480, 270))
+            _, buffer = cv2.imencode('.jpg', preview_frame, [cv2.IMWRITE_JPEG_QUALITY, 70])
+            frame_b64 = base64.b64encode(buffer).decode('utf-8')
+            
+            yield {
+                "type": "progress",
+                "frame": frame_idx,
+                "total_frames": total_frames,
+                "progress_percent": round((frame_idx / total_frames) * 100, 1),
+                "people_count": frame_people,
+                "unique_people": len(unique_ids),
+                "shuttle_detected": current_shuttle_pos is not None,
+                "shuttle_position": current_shuttle_pos,
+                "wrists": frame_wrists,
+                "preview_image": f"data:image/jpeg;base64,{frame_b64}"
+            }
     # Release video writer
     out.release()
     
-    print(f"✅ Tracking complete! Processed {frame_idx} frames")
-    print(f"✅ Found {len(unique_ids)} unique people")
-    print(f"✅ Detected shuttle in {sum(1 for pos in shuttle_positions if pos is not None)} frames")
-    print(f"✅ Annotated video saved to: {output_path}")
-    
-    return shuttle_positions, wrist_data, unique_ids, str(output_path)
+    yield {
+        "type": "complete",
+        "total_frames": frame_idx,
+        "unique_people": len(unique_ids),
+        "shuttle_detections": sum(1 for pos in shuttle_positions if pos is not None),
+        "wrist_data_points": len(wrist_data),
+        "output_video": str(output_path),
+        "summary": {
+            "detection_rate": round((sum(1 for pos in shuttle_positions if pos is not None) / len(shuttle_positions)) * 100, 1) if shuttle_positions else 0
+        }
+    }
