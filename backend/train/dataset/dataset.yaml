@@ -1,0 +1,6 @@
+names:
+  0: shuttle
+nc: 1
+path: D:\Personal Projects\Badminton Analysis\game-tracker\backend\train\dataset
+train: images/train
+val: images/val
