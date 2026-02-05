@@ -22,16 +22,12 @@ Badminton scoring is fast-paced and difficult to track manually. This app aims t
 
 ### 📹 Video Input
 
-* Upload video from device gallery
-* (Future) Record video directly inside the app
+* Upload video from device gallery / Record video directly inside the app 
 
 ### 🧠 AI-Powered Analysis
 
-* Shuttle detection & tracking (TrackNet / YOLO-based)
-* Player detection & pose estimation
-* Shot detection (smash, clear, drop, net shot)
+* Shuttle detection & tracking (TrackNet and YOLO-based)
 * Rally segmentation
-* Contact detection between racket & shuttle
 
 ### 🧮 Scoring Engine
 
@@ -42,10 +38,12 @@ Badminton scoring is fast-paced and difficult to track manually. This app aims t
 
 ### 📊 Output & Insights
 
-* Final match score
-* Rally count & duration
-* Shot distribution
-* Player movement analysis (future)
+* Player movement analysis
+* Shuttle tracking
+* Rally count & duration (future)
+* Shot distribution (future)
+* Final match score (future)
+
 
 ---
 
@@ -57,8 +55,8 @@ Badminton scoring is fast-paced and difficult to track manually. This app aims t
 * **React Native**
 * **Expo Router**
 * **TypeScript**
-* **Expo Image Picker** – video selection
-* **Expo Image** – efficient rendering
+* **Expo Video Picker** – video selection
+* **Expo Video Player** – video playback
 
 ### Backend / ML (Separate Service)
 
@@ -66,7 +64,6 @@ Badminton scoring is fast-paced and difficult to track manually. This app aims t
 * **OpenCV** for video frame processing
 * **YOLOv8** – player & shuttle detection
 * **TrackNet** – shuttle tracking
-* **ST-GCN / Temporal Models** – action & shot detection
 
 > ⚠️ This repository focuses on the **mobile application layer**. The ML pipeline runs as a separate backend service.
 
@@ -76,10 +73,7 @@ Badminton scoring is fast-paced and difficult to track manually. This app aims t
 
 ```text
 app/
- ├── (tabs)/
- │   ├── index.tsx        # Home screen
- │   ├── upload.tsx       # Video upload & preview
- │   └── results.tsx      # Scoring & analytics output
+ ├── index.tsx        # Home screen
  ├── _layout.tsx          # App layout & routing
 
 components/
@@ -169,16 +163,8 @@ video=<match.mp4>
 
 Response:
 
-```json
-{
-  "score": { "playerA": 21, "playerB": 18 },
-  "rallies": 39,
-  "shots": {
-    "smash": 12,
-    "drop": 8,
-    "clear": 15
-  }
-}
+```
+Video
 ```
 
 ---
@@ -199,8 +185,12 @@ Response:
 🚧 **Work in Progress**
 
 * App scaffolding complete
-* Video picker integration in progress
-* Backend experimentation with YOLO & TrackNet
+* Video picker integration completed
+* Backend experimentation with YOLO & TrackNet completed
+* Court mapping pending
+* Shot detection pending
+* Rally segmentation pending
+* Scoring logic pending
 
 ---
 
@@ -208,7 +198,6 @@ Response:
 
 * Real-time scoring
 * Match replay with overlays
-* Cloud processing & job status tracking
 * Player comparison dashboards
 * Coach & training mode
 

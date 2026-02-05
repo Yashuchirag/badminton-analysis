@@ -14,6 +14,7 @@ import * as ImagePicker from 'expo-image-picker';
 import { Image } from 'expo-image';
 import { Video, ResizeMode } from 'expo-av';
 
+
 import { ThemedView } from '@/components/themed-view';
 import { ThemedText } from '@/components/themed-text';
 
@@ -48,7 +49,7 @@ export default function HomeScreen() {
   });
   const [finalResult, setFinalResult] = useState<any>(null);
   const [error, setError] = useState<string | null>(null);
-  
+
   const progressAnim = useRef(new Animated.Value(0)).current;
   const pollingInterval = useRef<number | null>(null);
 
@@ -56,9 +57,9 @@ export default function HomeScreen() {
     if (jobId && processing) {
       pollingInterval.current = setInterval(async () => {
         try {
-          const response = await fetch(`http://192.168.68.70:8000/job-status/${jobId}`);
+          const response = await fetch(`http://192.168.68.73:8000/job-status/${jobId}`);
           const data = await response.json();
-          
+
           if (data.status === 'processing') {
             updateProgress(data);
           } else if (data.status === 'complete') {
@@ -88,11 +89,11 @@ export default function HomeScreen() {
     setCurrentFrame(data.frame || 0);
     setTotalFrames(data.total_frames || 0);
     setProgress(data.progress_percent || 0);
-    
+
     if (data.preview_image) {
       setPreviewImage(data.preview_image);
     }
-    
+
     setLiveStats({
       people: data.people_count || 0,
       uniquePeople: data.unique_people || 0,
@@ -186,7 +187,7 @@ export default function HomeScreen() {
     } as any);
 
     try {
-      const response = await fetch('http://192.168.68.70:8000/track-human-video-async', {
+      const response = await fetch('http://192.168.68.73:8000/track-human-video-async', {
         method: 'POST',
         body: formData,
         headers: {
@@ -197,7 +198,7 @@ export default function HomeScreen() {
       if (!response.ok) throw new Error('Server error');
 
       const data = await response.json();
-      
+
       if (data.job_id) {
         setJobId(data.job_id);
         setTotalFrames(data.total_frames || 0);
@@ -216,7 +217,7 @@ export default function HomeScreen() {
     if (!finalResult?.output_video) return;
 
     try {
-      const url = `http://192.168.68.70:8000/download-video?path=${encodeURIComponent(finalResult.output_video)}`;
+      const url = `http://192.168.68.73:8000/download-video?path=${encodeURIComponent(finalResult.output_video)}`;
       Alert.alert('Download Ready', `Video URL: ${url}`, [
         { text: 'OK' }
       ]);
@@ -276,10 +277,10 @@ export default function HomeScreen() {
               <ActivityIndicator color="#3B82F6" size="small" />
               <ThemedText style={styles.statusTitle}>Processing Video</ThemedText>
             </View>
-            
+
             {/* Progress Bar */}
             <View style={styles.progressBarContainer}>
-              <Animated.View 
+              <Animated.View
                 style={[
                   styles.progressBarFill,
                   {
@@ -288,37 +289,13 @@ export default function HomeScreen() {
                       outputRange: ['0%', '100%']
                     })
                   }
-                ]} 
+                ]}
               />
             </View>
-            
+
             <ThemedText style={styles.progressText}>
               {currentFrame} / {totalFrames} frames ({progress.toFixed(1)}%)
             </ThemedText>
-
-            {/* Live Stats */}
-            <View style={styles.liveStatsGrid}>
-              <View style={styles.liveStatBox}>
-                <Text style={styles.statIcon}>👥</Text>
-                <ThemedText style={styles.liveStatValue}>{liveStats.people}</ThemedText>
-                <ThemedText style={styles.liveStatLabel}>Current</ThemedText>
-              </View>
-              <View style={styles.liveStatBox}>
-                <Text style={styles.statIcon}>🏃</Text>
-                <ThemedText style={styles.liveStatValue}>{liveStats.uniquePeople}</ThemedText>
-                <ThemedText style={styles.liveStatLabel}>Total</ThemedText>
-              </View>
-              <View style={styles.liveStatBox}>
-                <Text style={styles.statIcon}>🏸</Text>
-                <ThemedText style={[
-                  styles.liveStatValue,
-                  { color: liveStats.shuttleDetected ? '#10B981' : '#64748B' }
-                ]}>
-                  {liveStats.shuttleDetected ? '✓' : '✗'}
-                </ThemedText>
-                <ThemedText style={styles.liveStatLabel}>Shuttle</ThemedText>
-              </View>
-            </View>
           </View>
         )}
 
@@ -345,37 +322,17 @@ export default function HomeScreen() {
         {finalResult && (
           <View style={styles.resultsContainer}>
             <ThemedText type="subtitle" style={styles.sectionTitle}>
-              📊 Final Results
+              📊 Tracked Results
             </ThemedText>
 
-            <View style={styles.statsGrid}>
-              <View style={[styles.statCard, { borderLeftColor: '#3B82F6' }]}>
-                <ThemedText style={styles.statLabel}>Total Frames</ThemedText>
-                <ThemedText style={styles.statValue}>{finalResult.total_frames}</ThemedText>
-              </View>
-              <View style={[styles.statCard, { borderLeftColor: '#10B981' }]}>
-                <ThemedText style={styles.statLabel}>Players</ThemedText>
-                <ThemedText style={styles.statValue}>{finalResult.unique_people}</ThemedText>
-              </View>
-              <View style={[styles.statCard, { borderLeftColor: '#F59E0B' }]}>
-                <ThemedText style={styles.statLabel}>Shuttle Rate</ThemedText>
-                <ThemedText style={styles.statValue}>
-                  {finalResult.summary?.detection_rate}%
-                </ThemedText>
-              </View>
-              <View style={[styles.statCard, { borderLeftColor: '#8B5CF6' }]}>
-                <ThemedText style={styles.statLabel}>Detections</ThemedText>
-                <ThemedText style={styles.statValue}>{finalResult.shuttle_detections}</ThemedText>
-              </View>
-            </View>
-
             {/* Download Button */}
-            <TouchableOpacity style={styles.downloadButton} onPress={downloadVideo}>
-              <Text style={styles.downloadIcon}>📥</Text>
-              <ThemedText style={styles.downloadText}>
-                Download Annotated Video
-              </ThemedText>
-            </TouchableOpacity>
+            <Video
+              source={{ uri: 'http://192.168.68.73:8000/track-human-video-async' }}
+              style={{ width: '100%', height: 300 }}
+              useNativeControls
+              isLooping
+              resizeMode={ResizeMode.CONTAIN}
+            />
           </View>
         )}
       </ThemedView>

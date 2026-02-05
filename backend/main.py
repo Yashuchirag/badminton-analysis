@@ -6,9 +6,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Dict
 
-from train.model_tracknet import TrackNet
-from infer import shuttle_tracking_combined
 from save_annotated_video_sync import process_video_sync
+from model2.train_and_track import *
 
 import cv2
 import tempfile
@@ -36,14 +35,6 @@ DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 print(f"Using device: {DEVICE}")
 
 model = YOLO("yolov8n.pt")
-pose_model = YOLO("yolov8n-pose.pt")
-
-tracknet = TrackNet().to(DEVICE)
-tracknet.load_state_dict(torch.load("tracknet.pth", map_location=DEVICE))
-tracknet.eval()
-print("TrackNet model loaded successfully")
-
-jobs: Dict[str, dict] = {}
 
 OUTPUT_DIR = Path("outputs")
 OUTPUT_DIR.mkdir(exist_ok=True)
@@ -120,28 +111,40 @@ async def track_human_video_async(background_tasks: BackgroundTasks, file: Uploa
     contents = await file.read()
     print("Request received for streaming")
 
+    tracker = ShuttleTracker(
+            yolo_weights="model2/runs/detect/yolo-runs/yolo_standard/weights/best.pt",
+            obb_weights="model2/runs/obb/yolo-obb/yolo_obb/weights/best.pt",
+            tracknet_weights="model2/runs/train-track/tracknet_best.pth",
+            device=DEVICE
+        )
+    
     with tempfile.NamedTemporaryFile(delete=False, suffix=".mp4") as tmp:
         tmp.write(contents)
         video_path = tmp.name
 
-    cap = cv2.VideoCapture(video_path)
-    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    cap.release()
+    
+    
+    # cap = cv2.VideoCapture(video_path)
+    # total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    # cap.release()
 
-    # Initialize job
-    jobs[job_id] = {
-        "status": "queued",
-        "frame": 0,
-        "total_frames": total_frames,
-        "progress_percent": 0,
-    }
+    
 
-    background_tasks.add_task(process_video_job, job_id, video_path)
+    tracker.track_video(
+            video_path=video_path,
+            output_path=OUTPUT_DIR + "/Sample_test.mp4",
+            mode="hybrid",
+            conf_threshold=0.25
+        )
+
 
     return {
-        "job_id": job_id,
-        "status": "queued",
-        "total_frames": total_frames
+        "message": "Video processing started successfully",
+        "video": FileResponse(
+            OUTPUT_DIR,
+            media_type="video/mp4",
+            filename="Sample_test.mp4"
+        )
     }
 
 
@@ -164,27 +167,3 @@ async def download_video(path: str):
         media_type="video/mp4",
         filename=os.path.basename(path)
     )
-
-@app.get("/list-videos")
-async def list_videos():
-    if not OUTPUT_DIR.exists():
-        return {"videos": []}
-    
-    videos = [
-        {
-            "filename": f.name,
-            "path": str(f),
-            "size_mb": round(f.stat().st_size / (1024 * 1024), 2),
-            "created": f.stat().st_mtime
-        }
-        for f in OUTPUT_DIR.glob("*.mp4")
-    ]
-    
-    return {"videos": sorted(videos, key=lambda x: x['created'], reverse=True)}
-
-@app.delete("/clear-jobs")
-async def clear_old_jobs():
-    """Clear completed jobs (call periodically)"""
-    global jobs
-    jobs = {k: v for k, v in jobs.items() if v["status"] not in ["complete", "error"]}
-    return {"message": "Cleared old jobs"}
