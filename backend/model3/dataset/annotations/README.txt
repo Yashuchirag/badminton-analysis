@@ -1,1 +1,0 @@
-TrackNet annotations (.json) will go here
