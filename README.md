@@ -1,5 +1,10 @@
 # 🏸 Badminton Video Scoring App
 
+# Video Preview
+
+https://github.com/user-attachments/assets/e4b456ac-ec4b-46cd-b771-2eaf450b4061
+
+
 An **Expo + React Native** mobile application that takes **badminton match videos** as input and produces **automated scoring and analytics** using computer vision and machine learning.
 
 This project aims to bridge **sports + software + AI**, focusing on offline/online video processing to detect rallies, shots, player actions, and scoring events in badminton matches.
