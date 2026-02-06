@@ -2,7 +2,10 @@
 
 # Video Preview
 
-https://github.com/user-attachments/assets/030b32bc-8911-4777-a746-f64145b064ea
+
+https://github.com/user-attachments/assets/9782b5b1-93be-4ccd-8e7e-540d336c683b
+
+
 
 An **Expo + React Native** mobile application that takes **badminton match videos** as input and produces **automated scoring and analytics** using computer vision and machine learning.
 
