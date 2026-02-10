@@ -26,7 +26,7 @@ except ImportError:
 
 
 # ══════════════════════════════════════════════════════════════════════════
-# 1. YOLO Training (Standard + OBB)
+# 1. YOLO Training (Standard + OBB) - WITH FINE-TUNING SUPPORT
 # ══════════════════════════════════════════════════════════════════════════
 
 class YOLOTrainer:
@@ -111,7 +111,7 @@ class YOLOTrainer:
         device: str = "0",
         pretrained: bool = True,
         yolo_version: str = "8",
-        resume_from: Optional[str] = None,
+        resume_from: Optional[str] = None,  # For fine-tuning from your own model
         **kwargs
     ):
         """Train standard YOLOv8/v11 with axis-aligned boxes.
@@ -120,6 +120,9 @@ class YOLOTrainer:
           • Clear, slow shuttles
           • Real-time inference requirements
           • General-purpose detection
+        
+        Args:
+            resume_from: Path to your previously trained .pt file for fine-tuning
         """
         if not YOLO_AVAILABLE:
             raise RuntimeError("ultralytics not installed. Run: pip install ultralytics")
@@ -130,8 +133,8 @@ class YOLOTrainer:
         if resume_from:
             print(f"Fine-tuning from: {resume_from}")
             model = YOLO(resume_from)
-            pretrained = False
-
+            pretrained = False  # We're using our own weights
+        
         # Standard mode: pretrained or from scratch
         elif pretrained:
             try:
@@ -191,7 +194,7 @@ class YOLOTrainer:
         device: str = "0",
         pretrained: bool = True,
         yolo_version: str = "8",
-        resume_from: Optional[str] = None,
+        resume_from: Optional[str] = None,  # For fine-tuning
         **kwargs
     ):
         """Train YOLOv8/v11-OBB with oriented bounding boxes.
@@ -207,7 +210,6 @@ class YOLOTrainer:
             raise RuntimeError("ultralytics not installed. Run: pip install ultralytics")
         
         yaml_path = YOLOTrainer.create_dataset_yaml(split_dir, use_obb=True)
-
 
         # Fine-tuning mode
         if resume_from:
@@ -263,7 +265,7 @@ class YOLOTrainer:
 
 
 # ══════════════════════════════════════════════════════════════════════════
-# 2. TrackNet Training (Temporal Heatmap Tracking)
+# 2. TrackNet Training (Temporal Heatmap Tracking) - WITH FINE-TUNING SUPPORT
 # ══════════════════════════════════════════════════════════════════════════
 
 class TrackNetDataset(Dataset):
@@ -442,7 +444,7 @@ class TrackNetTrainer:
         batch_size: int = 8,
         lr: float = 1e-4,
         device: str = "cuda" if torch.cuda.is_available() else "cpu",
-        resume_from: Optional[str] = None
+        resume_from: Optional[str] = None  # Path to checkpoint for fine-tuning
     ):
         """Train TrackNet model.
         
@@ -455,6 +457,7 @@ class TrackNetTrainer:
             batch_size: Batch size
             lr: Learning rate
             device: 'cuda' or 'cpu'
+            resume_from: Optional path to checkpoint for fine-tuning/resuming
         """
         if not TORCH_AVAILABLE:
             raise RuntimeError("PyTorch not installed. Run: pip install torch torchvision")
@@ -531,7 +534,7 @@ class TrackNetTrainer:
             
             val_loss /= len(val_loader)
             
-            print(f"Epoch {epoch+1}/{epochs}  Train Loss: {train_loss:.6f}  Val Loss: {val_loss:.6f}")
+            print(f"Epoch {epoch+1}/{start_epoch + epochs}  Train Loss: {train_loss:.6f}  Val Loss: {val_loss:.6f}")
             
             # Save best model
             if val_loss < best_val_loss:
@@ -555,7 +558,7 @@ class TrackNetTrainer:
 
 
 # ══════════════════════════════════════════════════════════════════════════
-# 3. Inference on New Videos
+# 3. Inference on New Videos (same as before)
 # ══════════════════════════════════════════════════════════════════════════
 
 class ShuttleTracker:
@@ -662,15 +665,7 @@ class ShuttleTracker:
                 trail.append((x, y))
                 
                 # Draw current position
-                # cv2.circle(frame, (x, y), 8, (0, 255, 0), -1)
                 cv2.circle(frame, (x, y), 12, (0, 255, 0), 2)
-                
-                # Draw trail
-                # if show_trail and len(trail) > 1:
-                #     for i in range(1, len(trail)):
-                #         alpha = i / len(trail)
-                #         color = (0, int(255 * alpha), 0)
-                #         cv2.line(frame, trail[i-1], trail[i], color, 2)
             
             # Info overlay
             cv2.putText(frame, f"Frame: {frame_idx}  Mode: {mode.upper()}",
@@ -765,95 +760,3 @@ class ShuttleTracker:
         if heatmap[y_max, x_max] > 0.5:
             return (x, y)
         return None
-
-
-# ══════════════════════════════════════════════════════════════════════════
-# 4. Main Entry Point
-# ══════════════════════════════════════════════════════════════════════════
-
-if __name__ == "__main__":
-    import argparse
-    
-    parser = argparse.ArgumentParser(description="Train and track shuttle")
-    parser.add_argument("--action", choices=["train-yolo", "train-obb", "train-tracknet", "track"],
-                       required=True)
-    
-    # Training args
-    parser.add_argument("--split-dir", help="Path to splits/ directory")
-    parser.add_argument("--output-dir", help="Where to save trained models")
-    parser.add_argument("--model-size", default="n", choices=["n", "s", "m", "l", "x"])
-    parser.add_argument("--epochs", type=int, default=10)
-    parser.add_argument("--batch", type=int, default=8)
-    parser.add_argument("--imgsz", type=int, default=640)
-    parser.add_argument("--device", default="0")
-    parser.add_argument("--yolo-version", default="8", choices=["8", "11"],
-                       help="YOLO version to use (default: 8, more stable)")
-    parser.add_argument("--mode", default="full", choices=["full", "finetune"])
-    
-    # TrackNet specific
-    parser.add_argument("--sequence-length", type=int, default=3)
-    parser.add_argument("--tracknet-img-size", type=int, default=512)
-    
-    # Inference args
-    parser.add_argument("--video", help="Input video for tracking")
-    parser.add_argument("--output-video", help="Output tracked video")
-    parser.add_argument("--yolo-weights", help="Path to YOLO weights")
-    parser.add_argument("--obb-weights", help="Path to OBB weights")
-    parser.add_argument("--tracknet-weights", help="Path to TrackNet weights")
-    parser.add_argument("--model-type", default="hybrid", choices=["yolo", "obb", "tracknet", "hybrid"])
-    parser.add_argument("--conf", type=float, default=0.25)
-    
-    args = parser.parse_args()
-    
-    if args.action == "train-yolo":
-        YOLOTrainer.train_standard(
-            split_dir=args.split_dir,
-            output_dir=args.output_dir,
-            model_size=args.model_size,
-            epochs=args.epochs,
-            imgsz=args.imgsz,
-            batch=args.batch,
-            device=args.device,
-            yolo_version=args.yolo_version,
-            mode=args.mode
-        )
-    
-    elif args.action == "train-obb":
-        YOLOTrainer.train_obb(
-            split_dir=args.split_dir,
-            output_dir=args.output_dir,
-            model_size=args.model_size,
-            epochs=args.epochs,
-            imgsz=args.imgsz,
-            batch=args.batch,
-            device=args.device,
-            yolo_version=args.yolo_version,
-            mode=args.mode
-        )
-    
-    elif args.action == "train-tracknet":
-        TrackNetTrainer.train(
-            split_dir=args.split_dir,
-            output_dir=args.output_dir,
-            sequence_length=args.sequence_length,
-            img_size=args.tracknet_img_size,
-            epochs=args.epochs,
-            batch_size=args.batch,
-            device=args.device,
-            mode=args.mode
-        )
-    
-    elif args.action == "track":
-        tracker = ShuttleTracker(
-            yolo_weights=args.yolo_weights,
-            obb_weights=args.obb_weights,
-            tracknet_weights=args.tracknet_weights,
-            device=args.device
-        )
-        
-        tracker.track_video(
-            video_path=args.video,
-            output_path=args.output_video,
-            mode=args.mode,
-            conf_threshold=args.conf
-        )

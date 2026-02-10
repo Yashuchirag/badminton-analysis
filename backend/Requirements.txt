@@ -6,7 +6,7 @@ uvicorn[standard]==0.27.1
 python-multipart==0.0.9
 
 # PyTorch with CUDA (installed separately via index-url) updated manually
-torch==2.5.1+cu121
+# torch==2.5.1+cu121
 torchvision
 
 # YOLO / Ultralytics

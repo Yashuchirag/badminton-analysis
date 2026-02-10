@@ -26,7 +26,13 @@ class VideoFrameExtractor:
             preserve_aspect: If True, maintain aspect ratio with padding
             target_size: (width, height) or None to keep original
         """
-        os.makedirs(output_dir, exist_ok=True)
+        version = 1
+        while True:
+            versioned_dir = os.path.join(output_dir, f"match{version}")
+            if not os.path.exists(versioned_dir):
+                break
+            version += 1
+        os.makedirs(versioned_dir, exist_ok=True)
         
         cap = cv2.VideoCapture(video_path)
         total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
@@ -66,7 +72,7 @@ class VideoFrameExtractor:
                         else:
                             frame = cv2.resize(frame, target_size)
                     
-                    output_path = os.path.join(output_dir, f"frame_{frame_num:06d}.jpg")
+                    output_path = os.path.join(versioned_dir, f"frame_{frame_num:06d}.jpg")
                     cv2.imwrite(output_path, frame, [cv2.IMWRITE_JPEG_QUALITY, 95])
                     extracted += 1
                     pbar.update(1)
@@ -79,14 +85,14 @@ class VideoFrameExtractor:
         cap.release()
         
         # Save metadata
-        metadata_path = os.path.join(output_dir, 'metadata.json')
+        metadata_path = os.path.join(versioned_dir, 'metadata.json')
         with open(metadata_path, 'w') as f:
             json.dump(metadata, f, indent=2)
         
-        print(f"Extracted {extracted} frames to {output_dir}")
+        print(f"Extracted {extracted} frames to {versioned_dir}")
         print(f"Metadata saved to {metadata_path}")
         
-        return extracted
+        return extracted, versioned_dir
     
     @staticmethod
     def _resize_with_padding(image, target_size):

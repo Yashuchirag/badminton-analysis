@@ -58,6 +58,7 @@ venv/
 *.pth
 *.mp4
 yolo*.pt
+ubenv/
 
 
 
