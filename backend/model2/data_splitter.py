@@ -1,6 +1,7 @@
 import os
 import json
 import shutil
+import re
 import numpy as np
 from collections import defaultdict
 from typing import List, Tuple, Dict, Any
@@ -222,6 +223,11 @@ class RallyAwareDatasetSplitter:
         print(f"  Val  : {len(val_frames):>5d} frames  ({len(val_rallies)} rallies)")
         print(f"  Test : {len(test_frames):>5d} frames  ({len(test_rallies)} rallies)")
         
+        # Versioning folder
+        output_base_dir = RallyAwareDatasetSplitter.get_next_version_folder(
+            output_base_dir
+        )
+        
         # ── Copy files ────────────────────────────────────────────────────
         RallyAwareDatasetSplitter._copy_splits(
             train_frames, val_frames, test_frames,
@@ -332,6 +338,11 @@ class RallyAwareDatasetSplitter:
         print(f"  Val  : {len(val_seqs):>4d} seqs → {len(val_frames):>5d} unique frames")
         print(f"  Test : {len(test_seqs):>4d} seqs → {len(test_frames):>5d} unique frames")
         
+        # Versioning folder
+        output_base_dir = RallyAwareDatasetSplitter.get_next_version_folder(
+            output_base_dir
+        )
+        
         # ── Copy files ────────────────────────────────────────────────────
         RallyAwareDatasetSplitter._copy_splits(
             train_frames, val_frames, test_frames,
@@ -398,10 +409,28 @@ class RallyAwareDatasetSplitter:
             with open(os.path.join(output_base_dir, split, "annotations.json"), "w") as out:
                 json.dump(subset, out, indent=2)
 
+    @staticmethod
+    def get_next_version_folder(base_dir):
+        """
+        Creates next version folder like v1, v2, v3...
+        Returns full path to new version directory.
+        """
+        os.makedirs(base_dir, exist_ok=True)
 
-# ══════════════════════════════════════════════════════════════════════════
-# Example usage
-# ══════════════════════════════════════════════════════════════════════════
+        existing_versions = []
+        
+        for name in os.listdir(base_dir):
+            match = re.match(r"v(\d+)", name)
+            if match:
+                existing_versions.append(int(match.group(1)))
+
+        next_version = max(existing_versions, default=0) + 1
+        new_version_folder = os.path.join(base_dir, f"v{next_version}")
+
+        os.makedirs(new_version_folder)
+
+        return new_version_folder
+
 
 if __name__ == "__main__":
     import argparse
