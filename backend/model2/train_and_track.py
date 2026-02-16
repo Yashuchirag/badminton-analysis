@@ -111,7 +111,9 @@ class YOLOTrainer:
         device: str = "0",
         pretrained: bool = True,
         yolo_version: str = "8",
-        resume_from: Optional[str] = None,
+        resume_from: Optional[str] = None,      # Resume interrupted training
+        finetune_from: Optional[str] = None,    # Fine-tune from pre-trained weights
+        freeze_layers: int = 0,                 # Number of layers to freeze for fine-tuning
         **kwargs
     ):
         """Train standard YOLOv8/v11 with axis-aligned boxes.
@@ -128,9 +130,28 @@ class YOLOTrainer:
 
         # Fine-tuning mode: load your own model
         if resume_from:
-            print(f"Fine-tuning from: {resume_from}")
+            if not os.path.exists(resume_from):
+                raise FileNotFoundError(f"Resume checkpoint not found: {resume_from}")
+            print(f"Resuming training from: {resume_from}")
             model = YOLO(resume_from)
-            pretrained = False
+            training_mode = "RESUME"
+            use_pretrained = False
+
+        # Mode 2: Fine-tune from existing weights
+        elif finetune_from:
+            if not os.path.exists(finetune_from):
+                raise FileNotFoundError(f"Fine-tune weights not found: {finetune_from}")
+            print(f"Fine-tuning from: {finetune_from}")
+            model = YOLO(finetune_from)
+            training_mode = "FINE-TUNE"
+            use_pretrained = False
+            
+            # Freeze layers if requested
+            if freeze_layers > 0:
+                print(f"  Freezing first {freeze_layers} layers")
+                for i, (name, param) in enumerate(model.model.named_parameters()):
+                    if i < freeze_layers:
+                        param.requires_grad = False
 
         # Standard mode: pretrained or from scratch
         elif pretrained:
@@ -138,34 +159,41 @@ class YOLOTrainer:
                 model_name = f"yolo{yolo_version}{model_size}.pt"
                 model = YOLO(model_name)
                 print(f"Using pretrained YOLOv{yolo_version}{model_size}")
+                training_mode = "PRETRAINED"
             except Exception as e:
                 print(f"⚠ YOLOv{yolo_version} not available, falling back to YOLOv8")
                 model_name = f"yolov8{model_size}.pt"
                 model = YOLO(model_name)
                 yolo_version = "8"
+                training_mode = "PRETRAINED"
+            use_pretrained = True
         else:
             model_name = f"yolo{yolo_version}{model_size}.yaml"
             model = YOLO(model_name)
+            training_mode = "FROM-SCRATCH"
+            use_pretrained = False
         
         print(f"\n{'='*70}")
         print(f"Training YOLOv{yolo_version}{model_size.upper()} - Standard Detection")
-        if resume_from:
-            print("  Mode: FINE-TUNING")
+        print(f"  Mode: {training_mode}")
+        if freeze_layers > 0:
+            print(f"  Frozen layers: {freeze_layers}")
         print(f"{'='*70}")
         
         # Train
         results = model.train(
-            data=yaml_path,
-            epochs=epochs,
-            imgsz=imgsz,
-            batch=batch,
-            device=device,
-            project=output_dir,
-            name="yolo_standard",
-            exist_ok=True,
-            pretrained=pretrained,
-            **kwargs
-        )
+                data=yaml_path,
+                epochs=epochs,
+                imgsz=imgsz,
+                batch=batch,
+                device=device,
+                project=output_dir,
+                name="yolo_standard",
+                exist_ok=True,
+                pretrained=use_pretrained,
+                resume=bool(resume_from),  # Only resume if resume_from is set
+                **kwargs
+            )
         
         # Validate
         metrics = model.val()
@@ -192,6 +220,8 @@ class YOLOTrainer:
         pretrained: bool = True,
         yolo_version: str = "8",
         resume_from: Optional[str] = None,
+        finetune_from: Optional[str] = None,
+        freeze_layers: int = 0,
         **kwargs
     ):
         """Train YOLOv8/v11-OBB with oriented bounding boxes.
@@ -208,32 +238,62 @@ class YOLOTrainer:
         
         yaml_path = YOLOTrainer.create_dataset_yaml(split_dir, use_obb=True)
 
-
-        # Fine-tuning mode
-        if resume_from:
-            print(f"Fine-tuning from: {resume_from}")
-            model = YOLO(resume_from)
-            pretrained = False
+        # Determine training mode
+        if resume_from and finetune_from:
+            raise ValueError("Cannot use both resume_from and finetune_from simultaneously")
         
-        # Standard mode
+
+        # Mode 1: Resume interrupted training
+        if resume_from:
+            if not os.path.exists(resume_from):
+                raise FileNotFoundError(f"Resume checkpoint not found: {resume_from}")
+            print(f"Resuming training from: {resume_from}")
+            model = YOLO(resume_from)
+            training_mode = "RESUME"
+            use_pretrained = False
+        
+        # Mode 2: Fine-tune from existing weights
+        elif finetune_from:
+            if not os.path.exists(finetune_from):
+                raise FileNotFoundError(f"Fine-tune weights not found: {finetune_from}")
+            print(f"Fine-tuning from: {finetune_from}")
+            model = YOLO(finetune_from)
+            training_mode = "FINE-TUNE"
+            use_pretrained = False
+            
+            # Freeze layers if requested
+            if freeze_layers > 0:
+                print(f"  Freezing first {freeze_layers} layers")
+                for i, (name, param) in enumerate(model.model.named_parameters()):
+                    if i < freeze_layers:
+                        param.requires_grad = False
+
+
+        # Mode 3: Train from pretrained or scratch
         elif pretrained:
             try:
                 model_name = f"yolo{yolo_version}{model_size}-obb.pt"
                 model = YOLO(model_name)
                 print(f"Using pretrained YOLOv{yolo_version}{model_size}-OBB")
+                training_mode = "PRETRAINED"
             except Exception as e:
                 print(f"⚠ YOLOv{yolo_version}-OBB not available, falling back to YOLOv8-OBB")
                 model_name = f"yolov8{model_size}-obb.pt"
                 model = YOLO(model_name)
                 yolo_version = "8"
+                training_mode = "PRETRAINED"
+            use_pretrained = True
         else:
             model_name = f"yolo{yolo_version}{model_size}-obb.yaml"
             model = YOLO(model_name)
-            
+            training_mode = "FROM-SCRATCH"
+            use_pretrained = False
+        
         print(f"\n{'='*70}")
         print(f"Training YOLOv{yolo_version}{model_size.upper()}-OBB - Oriented Detection")
-        if resume_from:
-            print("  Mode: FINE-TUNING")
+        print(f"  Mode: {training_mode}")
+        if freeze_layers > 0:
+            print(f"  Frozen layers: {freeze_layers}")
         print(f"{'='*70}")
         
         results = model.train(
@@ -245,7 +305,8 @@ class YOLOTrainer:
             project=output_dir,
             name="yolo_obb",
             exist_ok=True,
-            pretrained=pretrained,
+            pretrained=use_pretrained,
+            resume=bool(resume_from),
             **kwargs
         )
         
@@ -441,8 +502,10 @@ class TrackNetTrainer:
         epochs: int = 10,
         batch_size: int = 8,
         lr: float = 1e-4,
-        device: str = "cuda" if torch.cuda.is_available() else "cpu",
-        resume_from: Optional[str] = None
+        device: str = '0',
+        resume_from: Optional[str] = None,      # Resume interrupted training
+        finetune_from: Optional[str] = None,    # Fine-tune from pre-trained weights
+        freeze_encoder: bool = False 
     ):
         """Train TrackNet model.
         
@@ -455,18 +518,38 @@ class TrackNetTrainer:
             batch_size: Batch size
             lr: Learning rate
             device: 'cuda' or 'cpu'
+            resume_from: Resume interrupted training from checkpoint
+            finetune_from: Fine-tune from pre-trained model
+            freeze_encoder: If True, freeze encoder layers during fine-tuning
         """
         if not TORCH_AVAILABLE:
             raise RuntimeError("PyTorch not installed. Run: pip install torch torchvision")
         
+        if device.isdigit():  # If device is "0", "1", etc.
+            device = f"cuda:{device}"
+            print(f"Using device: {device}")
+        elif device == "cuda" and not torch.cuda.is_available():
+            print("⚠ CUDA not available, falling back to CPU")
+            device = "cpu"
+        
         os.makedirs(output_dir, exist_ok=True)
+
+        # Determine training mode
+        if resume_from and finetune_from:
+            raise ValueError("Cannot use both resume_from and finetune_from simultaneously")
         
         # Datasets
-        train_dataset = TrackNetDataset(split_dir, "train", sequence_length, img_size)
-        val_dataset = TrackNetDataset(split_dir, "val", sequence_length, img_size)
+        try:
+            train_dataset = TrackNetDataset(split_dir, "train", sequence_length, img_size)
+            val_dataset = TrackNetDataset(split_dir, "val", sequence_length, img_size)
+        except Exception as e:
+            print(f"❌ Failed to load datasets: {str(e)}")
+            raise
         
-        train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=4)
-        val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=4)
+        train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, 
+                                 num_workers=4, pin_memory=True if device == "cuda" else False)
+        val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, 
+                               num_workers=4, pin_memory=True if device == "cuda" else False)
         
         # Model
         model = TrackNet(sequence_length).to(device)
@@ -475,21 +558,49 @@ class TrackNetTrainer:
         
         start_epoch = 0
         best_val_loss = float('inf')
+        training_mode = "FROM SCRATCH"
         
-        # Load checkpoint if resuming
-        if resume_from and os.path.exists(resume_from):
+        # Mode 1: Resume interrupted training
+        if resume_from:
+            if not os.path.exists(resume_from):
+                raise FileNotFoundError(f"Resume checkpoint not found: {resume_from}")
+            
             print(f"  Loading checkpoint from: {resume_from}")
             checkpoint = torch.load(resume_from, map_location=device)
             model.load_state_dict(checkpoint['model_state_dict'])
             optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
             start_epoch = checkpoint.get('epoch', 0) + 1
             best_val_loss = checkpoint.get('val_loss', float('inf'))
+            training_mode = "RESUME"
             print(f"  Resuming from epoch {start_epoch}")
+        
+        # Mode 2: Fine-tune from pre-trained weights
+        elif finetune_from:
+            if not os.path.exists(finetune_from):
+                raise FileNotFoundError(f"Fine-tune checkpoint not found: {finetune_from}")
+            
+            print(f"  Loading pre-trained weights from: {finetune_from}")
+            checkpoint = torch.load(finetune_from, map_location=device)
+            model.load_state_dict(checkpoint['model_state_dict'])
+            training_mode = "FINE-TUNE"
+            
+            # Freeze encoder if requested
+            if freeze_encoder:
+                print(f"  Freezing encoder layers")
+                for name, param in model.named_parameters():
+                    if 'conv1' in name or 'conv2' in name or 'conv3' in name:
+                        param.requires_grad = False
+                
+                # Re-create optimizer with only trainable parameters
+                optimizer = optim.Adam(filter(lambda p: p.requires_grad, model.parameters()), lr=lr)
+            
+            print(f"  Starting fine-tuning from epoch 0")
         
         print(f"\n{'='*70}")
         print("Training TrackNet")
-        if resume_from:
-            print("  Mode: FINE-TUNING")
+        print(f"  Mode: {training_mode}")
+        if freeze_encoder:
+            print(f"  Encoder: FROZEN")
         print(f"{'='*70}")
         print(f"  Device: {device}")
         print(f"  Sequence length: {sequence_length}")
@@ -514,6 +625,9 @@ class TrackNetTrainer:
                 optimizer.step()
                 
                 train_loss += loss.item()
+
+                # Print progress every 10 batches
+                
             
             train_loss /= len(train_loader)
             
@@ -533,21 +647,33 @@ class TrackNetTrainer:
             
             print(f"Epoch {epoch+1}/{epochs}  Train Loss: {train_loss:.6f}  Val Loss: {val_loss:.6f}")
             
+            # Save checkpoint every epoch
+            checkpoint_path = os.path.join(output_dir, f'tracknet_epoch_{epoch+1}.pth')
+            torch.save({
+                'epoch': epoch,
+                'model_state_dict': model.state_dict(),
+                'optimizer_state_dict': optimizer.state_dict(),
+                'train_loss': train_loss,
+                'val_loss': val_loss,
+            }, checkpoint_path)
+
             # Save best model
             if val_loss < best_val_loss:
                 best_val_loss = val_loss
+                best_path = os.path.join(output_dir, 'tracknet_best.pth')
                 torch.save({
                     'epoch': epoch,
                     'model_state_dict': model.state_dict(),
                     'optimizer_state_dict': optimizer.state_dict(),
+                    'train_loss': train_loss,
                     'val_loss': val_loss,
-                }, os.path.join(output_dir, 'tracknet_best.pth'))
+                }, best_path)
                 print(f"  → Saved best model (val_loss: {val_loss:.6f})")
         
         print(f"\n{'='*70}")
         print("TrackNet Training Complete")
         print(f"{'='*70}")
-        print(f"  Best weights: {output_dir}/tracknet_best.pth")
+        print(f"  Best weights: {output_dir}/tracknet/tracknet_best.pth")
         print(f"  Best val loss: {best_val_loss:.6f}")
         print(f"{'='*70}\n")
         
@@ -562,7 +688,7 @@ class ShuttleTracker:
     """Unified inference for YOLO, TrackNet, and hybrid tracking."""
     
     def __init__(self, yolo_weights=None, obb_weights=None, tracknet_weights=None,
-                 device="cuda" if torch.cuda.is_available() else "cpu"):
+                 device='0'):
         """
         Args:
             yolo_weights: Path to YOLO standard weights
@@ -574,6 +700,15 @@ class ShuttleTracker:
         self.yolo_model = None
         self.obb_model = None
         self.tracknet_model = None
+
+        if self.device.isdigit():  # If device is "0", "1", etc.
+            self.device = f"cuda:{self.device}"
+            print(f"Using device: {self.device}")
+        elif self.device == "cuda" and not torch.cuda.is_available():
+            print("⚠ CUDA not available, falling back to CPU")
+            self.device = "cpu"
+        
+        print(f"Using device: {self.device}")
         
         if yolo_weights and YOLO_AVAILABLE:
             self.yolo_model = YOLO(yolo_weights)
@@ -584,8 +719,8 @@ class ShuttleTracker:
             print(f"✓ Loaded YOLO-OBB: {obb_weights}")
         
         if tracknet_weights and TORCH_AVAILABLE:
-            checkpoint = torch.load(tracknet_weights, map_location=device)
-            self.tracknet_model = TrackNet(sequence_length=3).to(device)
+            checkpoint = torch.load(tracknet_weights, map_location=self.device)
+            self.tracknet_model = TrackNet(sequence_length=3).to(self.device)
             self.tracknet_model.load_state_dict(checkpoint['model_state_dict'])
             self.tracknet_model.eval()
             print(f"✓ Loaded TrackNet: {tracknet_weights}")
@@ -788,11 +923,19 @@ if __name__ == "__main__":
     parser.add_argument("--device", default="0")
     parser.add_argument("--yolo-version", default="8", choices=["8", "11"],
                        help="YOLO version to use (default: 8, more stable)")
-    parser.add_argument("--mode", default="full", choices=["full", "finetune"])
+    
+    # Fine-tuning args
+    parser.add_argument("--resume-from", help="Resume interrupted training from checkpoint")
+    parser.add_argument("--finetune-from", help="Fine-tune from pre-trained weights")
+    parser.add_argument("--freeze-layers", type=int, default=0,
+                       help="Number of layers to freeze for YOLO fine-tuning (0-10)")
+    parser.add_argument("--freeze-encoder", action="store_true",
+                       help="Freeze encoder layers for TrackNet fine-tuning")
     
     # TrackNet specific
     parser.add_argument("--sequence-length", type=int, default=3)
     parser.add_argument("--tracknet-img-size", type=int, default=512)
+    parser.add_argument("--lr", type=float, default=1e-4, help="Learning rate for TrackNet")
     
     # Inference args
     parser.add_argument("--video", help="Input video for tracking")
@@ -800,60 +943,74 @@ if __name__ == "__main__":
     parser.add_argument("--yolo-weights", help="Path to YOLO weights")
     parser.add_argument("--obb-weights", help="Path to OBB weights")
     parser.add_argument("--tracknet-weights", help="Path to TrackNet weights")
-    parser.add_argument("--model-type", default="hybrid", choices=["yolo", "obb", "tracknet", "hybrid"])
+    parser.add_argument("--mode", default="hybrid", choices=["yolo", "obb", "tracknet", "hybrid"])
     parser.add_argument("--conf", type=float, default=0.25)
     
     args = parser.parse_args()
     
-    if args.action == "train-yolo":
-        YOLOTrainer.train_standard(
-            split_dir=args.split_dir,
-            output_dir=args.output_dir,
-            model_size=args.model_size,
-            epochs=args.epochs,
-            imgsz=args.imgsz,
-            batch=args.batch,
-            device=args.device,
-            yolo_version=args.yolo_version,
-            mode=args.mode
-        )
-    
-    elif args.action == "train-obb":
-        YOLOTrainer.train_obb(
-            split_dir=args.split_dir,
-            output_dir=args.output_dir,
-            model_size=args.model_size,
-            epochs=args.epochs,
-            imgsz=args.imgsz,
-            batch=args.batch,
-            device=args.device,
-            yolo_version=args.yolo_version,
-            mode=args.mode
-        )
-    
-    elif args.action == "train-tracknet":
-        TrackNetTrainer.train(
-            split_dir=args.split_dir,
-            output_dir=args.output_dir,
-            sequence_length=args.sequence_length,
-            img_size=args.tracknet_img_size,
-            epochs=args.epochs,
-            batch_size=args.batch,
-            device=args.device,
-            mode=args.mode
-        )
-    
-    elif args.action == "track":
-        tracker = ShuttleTracker(
-            yolo_weights=args.yolo_weights,
-            obb_weights=args.obb_weights,
-            tracknet_weights=args.tracknet_weights,
-            device=args.device
-        )
+    try:
+        if args.action == "train-yolo":
+            YOLOTrainer.train_standard(
+                split_dir=args.split_dir,
+                output_dir=args.output_dir,
+                model_size=args.model_size,
+                epochs=args.epochs,
+                imgsz=args.imgsz,
+                batch=args.batch,
+                device=args.device,
+                yolo_version=args.yolo_version,
+                resume_from=args.resume_from,
+                finetune_from=args.finetune_from,
+                freeze_layers=args.freeze_layers
+            )
         
-        tracker.track_video(
-            video_path=args.video,
-            output_path=args.output_video,
-            mode=args.mode,
-            conf_threshold=args.conf
-        )
+        elif args.action == "train-obb":
+            YOLOTrainer.train_obb(
+                split_dir=args.split_dir,
+                output_dir=args.output_dir,
+                model_size=args.model_size,
+                epochs=args.epochs,
+                imgsz=args.imgsz,
+                batch=args.batch,
+                device=args.device,
+                yolo_version=args.yolo_version,
+                resume_from=args.resume_from,
+                finetune_from=args.finetune_from,
+                freeze_layers=args.freeze_layers
+            )
+        
+        elif args.action == "train-tracknet":
+            TrackNetTrainer.train(
+                split_dir=args.split_dir,
+                output_dir=args.output_dir,
+                sequence_length=args.sequence_length,
+                img_size=args.tracknet_img_size,
+                epochs=args.epochs,
+                batch_size=args.batch,
+                lr=args.lr,
+                device=args.device,
+                resume_from=args.resume_from,
+                finetune_from=args.finetune_from,
+                freeze_encoder=args.freeze_encoder
+            )
+        
+        elif args.action == "track":
+            tracker = ShuttleTracker(
+                yolo_weights=args.yolo_weights,
+                obb_weights=args.obb_weights,
+                tracknet_weights=args.tracknet_weights,
+                device=args.device
+            )
+            
+            tracker.track_video(
+                video_path=args.video,
+                output_path=args.output_video,
+                mode=args.mode,
+                conf_threshold=args.conf
+            )
+    
+    except Exception as e:
+        print(f"\n❌ Error: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        exit(1)

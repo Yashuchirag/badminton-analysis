@@ -1,5 +1,6 @@
 import cv2
 import os
+import re
 import numpy as np
 import json
 from pathlib import Path
@@ -7,6 +8,7 @@ from tqdm import tqdm
 from collections import defaultdict
 from data_splitter import *
 import copy
+
 
 
 class VideoFrameExtractor:
@@ -127,9 +129,29 @@ class ShuttleAnnotationTool:
         self.display_height = display_height
         os.makedirs(output_dir, exist_ok=True)
 
+        # Find existing version folders (v1, v2, v3...)
+        existing_versions = [
+            d for d in os.listdir(output_dir)
+            if os.path.isdir(os.path.join(output_dir, d)) and re.match(r"v\d+", d)
+        ]
+
+        # Extract version numbers
+        version_numbers = [
+            int(re.search(r"\d+", v).group()) for v in existing_versions
+        ]
+
+        # Determine next version
+        next_version = max(version_numbers) + 1 if version_numbers else 1
+
+        # Create new version folder
+        self.output_dir = os.path.join(output_dir, f"v{next_version}")
+        os.makedirs(self.output_dir, exist_ok=True)
+
+
         self.images = sorted(
             [f for f in os.listdir(image_dir) if f.endswith((".jpg", ".png", ".jpeg"))]
         )
+
 
         if not self.images:
             raise ValueError(f"No images found in {image_dir}")
@@ -1074,41 +1096,43 @@ if __name__ == "__main__":
     parser.add_argument('--action', 
                        choices=['extract', 'annotate', 'split', 'create-structure'],
                        required=True, help='Action to perform')
-    parser.add_argument('--annotation-output', type=str,
-                        help="[split] Annotator's output_dir (contains annotations.json, yolo_labels/, yolo_obb_labels/)")
+
+    # Common arguments
     parser.add_argument('--video', type=str, help='Video file path')
     parser.add_argument('--images', type=str, help='Images directory')
     parser.add_argument('--labels', type=str, help='Labels directory')
     parser.add_argument('--output', type=str, help='Output directory')
+
+    # Extract arguments
     parser.add_argument('--sample-rate', type=int, default=1, help='Frame sampling rate')
     parser.add_argument('--max-frames', type=int, help='Maximum frames to extract')
+
+
+    # Annotate argument
     parser.add_argument('--display-height', type=int, default=960, help='Display height for annotation')
-    parser.add_argument('--train-ratio', type=float, default=0.7, help='Training set ratio')
-    parser.add_argument('--val-ratio', type=float, default=0.15, help='Validation set ratio')
-    parser.add_argument('--test-ratio', type=float, default=0.15, help='Test set ratio')
-    parser.add_argument('--stratify-by', type=str, default='visibility',
-                        choices=['visibility', 'blur', 'both', 'none'],
-                        help='[split] Stratification axis (default: visibility)')
+
+    # Split arguments
+    parser.add_argument('--annotation-output', type=str,
+                        help="[split] Annotator's output_dir (contains annotations.json, yolo_labels/, yolo_obb_labels/)")
+    parser.add_argument("--method", choices=["rally", "sequence"], required=False)
+    parser.add_argument('--train-ratio', type=float, default=0.7, help='[split] Training set ratio')
+    parser.add_argument('--val-ratio', type=float, default=0.15, help='[split] Validation set ratio')
+    parser.add_argument('--test-ratio', type=float, default=0.15, help='[split] Test set ratio')
+    parser.add_argument("--stratify-by", default="difficulty",
+                        choices=["difficulty", "length", "none"])
     parser.add_argument('--temporal-gap', type=int, default=1,
                         help='[split] Temporal gap between chunks (default: 1)')
     parser.add_argument('--max-chunk-size', type=int, default=10,
                         help='[split] Maximum chunk size (default: 10)')
     parser.add_argument('--seed', type=int, default=42,
                         help='[split] Random seed for reproducibility (default: 42)')
-    parser.add_argument("--method", choices=["rally", "sequence"], required=True)
     
-    parser.add_argument("--annotations", required=True)
-    
-    parser.add_argument("--train-ratio", type=float, default=0.70)
-    parser.add_argument("--val-ratio", type=float, default=0.15)
-    parser.add_argument("--test-ratio", type=float, default=0.15)
-    parser.add_argument("--stratify-by", default="difficulty",
-                        choices=["difficulty", "length", "none"])
+
     parser.add_argument("--sequence-length", type=int, default=16)
     parser.add_argument("--sequence-stride", type=int, default=8)
     parser.add_argument("--min-rally-length", type=int, default=10)
     parser.add_argument("--max-gap", type=int, default=5)
-    parser.add_argument("--seed", type=int, default=42)
+    
 
     args = parser.parse_args()
     
@@ -1138,7 +1162,7 @@ if __name__ == "__main__":
         if args.method == "rally":
             RallyAwareDatasetSplitter.split_by_rally(
                 images_dir=args.images,
-                annotation_output_dir=args.annotations,
+                annotation_output_dir=args.annotation_output,
                 output_base_dir=args.output,
                 train_ratio=args.train_ratio,
                 val_ratio=args.val_ratio,
@@ -1151,7 +1175,7 @@ if __name__ == "__main__":
         else:  # sequence
             RallyAwareDatasetSplitter.split_by_sequence(
                 images_dir=args.images,
-                annotation_output_dir=args.annotations,
+                annotation_output_dir=args.annotation_output,
                 output_base_dir=args.output,
                 train_ratio=args.train_ratio,
                 val_ratio=args.val_ratio,
