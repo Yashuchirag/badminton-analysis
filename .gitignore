@@ -59,6 +59,9 @@ venv/
 *.mp4
 yolo*.pt
 ubenv/
+runs/
+backend/model2/trained_models/
+
 
 
 

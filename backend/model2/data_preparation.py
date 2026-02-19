@@ -129,23 +129,33 @@ class ShuttleAnnotationTool:
         self.display_height = display_height
         os.makedirs(output_dir, exist_ok=True)
 
-        # Find existing version folders (v1, v2, v3...)
-        existing_versions = [
-            d for d in os.listdir(output_dir)
-            if os.path.isdir(os.path.join(output_dir, d)) and re.match(r"v\d+", d)
-        ]
+        # # Find existing version folders (v1, v2, v3...)
+        # existing_versions = [
+        #     d for d in os.listdir(output_dir)
+        #     if os.path.isdir(os.path.join(output_dir, d)) and re.match(r"v\d+", d)
+        # ]
 
-        # Extract version numbers
-        version_numbers = [
-            int(re.search(r"\d+", v).group()) for v in existing_versions
-        ]
+        # # Extract version numbers
+        # version_numbers = [
+        #     int(re.search(r"\d+", v).group()) for v in existing_versions
+        # ]
 
-        # Determine next version
-        next_version = max(version_numbers) + 1 if version_numbers else 1
+        # # Determine next version
+        # next_version = max(version_numbers) + 1 if version_numbers else 1
 
-        # Create new version folder
-        self.output_dir = os.path.join(output_dir, f"v{next_version}")
-        os.makedirs(self.output_dir, exist_ok=True)
+        # # Create new version folder
+        # self.output_dir = os.path.join(output_dir, f"v{next_version}")
+        # os.makedirs(self.output_dir, exist_ok=True)
+        # print("self.output_dir: ", self.output_dir)
+
+        version = 1
+        while True:
+            self.versioned_output_dir = os.path.join(self.output_dir, f"match{version}")
+            if not os.path.exists(self.versioned_output_dir):
+                break
+            version += 1
+        os.makedirs(self.versioned_output_dir, exist_ok=True)
+        print("self.versioned_output_dir: ", self.versioned_output_dir)
 
 
         self.images = sorted(
@@ -280,7 +290,7 @@ class ShuttleAnnotationTool:
 
     def _load_existing_annotations(self):
         """Load previously saved annotations if they exist"""
-        json_path = os.path.join(self.output_dir, "annotations.json")
+        json_path = os.path.join(self.versioned_output_dir, "annotations.json")
         if os.path.exists(json_path):
             with open(json_path, "r") as f:
                 data = json.load(f)
@@ -860,7 +870,7 @@ class ShuttleAnnotationTool:
     def _save_all_annotations(self):
         """Persist annotations in JSON + YOLO formats."""
         # Raw JSON
-        json_path = os.path.join(self.output_dir, "annotations.json")
+        json_path = os.path.join(self.versioned_output_dir, "annotations.json")
         with open(json_path, "w") as f:
             json.dump(self.annotations, f, indent=2)
         print(f"Saved raw annotations → {json_path}")
@@ -870,8 +880,8 @@ class ShuttleAnnotationTool:
 
     def _save_yolo_format(self):
         """Write standard YOLO and YOLO-OBB label files for every annotated image."""
-        yolo_dir     = os.path.join(self.output_dir, "yolo_labels")
-        yolo_obb_dir = os.path.join(self.output_dir, "yolo_obb_labels")
+        yolo_dir     = os.path.join(self.versioned_output_dir, "yolo_labels")
+        yolo_obb_dir = os.path.join(self.versioned_output_dir, "yolo_obb_labels")
         os.makedirs(yolo_dir, exist_ok=True)
         os.makedirs(yolo_obb_dir, exist_ok=True)
 
@@ -1034,7 +1044,7 @@ class ShuttleAnnotationTool:
             "recommended_actions": recommendations,
         }
 
-        path = os.path.join(self.output_dir, "validation_info.json")
+        path = os.path.join(self.versioned_output_dir, "validation_info.json")
         with open(path, "w") as f:
             json.dump(info, f, indent=2)
         print(f"Saved validation info → {path}")

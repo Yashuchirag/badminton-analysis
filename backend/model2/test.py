@@ -5,8 +5,7 @@ import cv2
 import numpy as np
 from pathlib import Path
 from collections import deque
-import pickle
-from datetime import datetime
+from typing import Optional, Tuple
 
 try:
     from ultralytics import YOLO
@@ -19,7 +18,7 @@ try:
     import torch
     import torch.nn as nn
     import torch.optim as optim
-    from torch.utils.data import Dataset, DataLoader, ConcatDataset
+    from torch.utils.data import Dataset, DataLoader
     TORCH_AVAILABLE = True
 except ImportError:
     TORCH_AVAILABLE = False
@@ -27,252 +26,68 @@ except ImportError:
 
 
 # ══════════════════════════════════════════════════════════════════════════
-# NEW: Data Management System
+# 1. YOLO Training (Standard + OBB)
 # ══════════════════════════════════════════════════════════════════════════
 
-class DataRegistry:
-    """Manages multiple video datasets and their metadata for incremental training."""
-    
-    def __init__(self, registry_path: str = "./data_registry.json"):
-        """
-        Args:
-            registry_path: Path to JSON file tracking all datasets
-        """
-        self.registry_path = registry_path
-        self.datasets = self._load_registry()
-    
-    def _load_registry(self):
-        """Load existing registry or create new one."""
-        if os.path.exists(self.registry_path):
-            with open(self.registry_path) as f:
-                return json.load(f)
-        return {
-            "datasets": {},
-            "training_history": [],
-            "active_datasets": []
-        }
-    
-    def save(self):
-        """Persist registry to disk."""
-        with open(self.registry_path, 'w') as f:
-            json.dump(self.datasets, f, indent=2)
-        print(f"✓ Registry saved to {self.registry_path}")
-    
-    def add_dataset(self, name: str, split_dir: str, metadata: dict = None):
-        """Register a new dataset.
-        
-        Args:
-            name: Unique dataset identifier (e.g., 'indoor_fast', 'outdoor_slow')
-            split_dir: Path to the splits/ directory
-            metadata: Optional dict with video characteristics:
-                - lighting: 'indoor', 'outdoor', 'mixed'
-                - speed: 'slow', 'medium', 'fast'
-                - resolution: '720p', '1080p', '4k'
-                - camera_angle: 'side', 'top', 'diagonal'
-                - players: 'singles', 'doubles'
-                - court_type: 'wood', 'synthetic', 'concrete'
-        """
-        if name in self.datasets["datasets"]:
-            print(f"⚠ Dataset '{name}' already exists. Use update_dataset() to modify.")
-            return
-        
-        # Validate split_dir exists
-        if not os.path.exists(split_dir):
-            raise ValueError(f"Split directory not found: {split_dir}")
-        
-        # Auto-detect some metadata if not provided
-        if metadata is None:
-            metadata = {}
-        
-        # Count frames
-        train_img_dir = os.path.join(split_dir, "train", "images")
-        if os.path.exists(train_img_dir):
-            metadata["train_frames"] = len([f for f in os.listdir(train_img_dir) if f.endswith(('.jpg', '.png'))])
-        
-        self.datasets["datasets"][name] = {
-            "split_dir": os.path.abspath(split_dir),
-            "metadata": metadata,
-            "added_date": datetime.now().isoformat(),
-            "trained_models": []  # Track which models used this data
-        }
-        
-        # Add to active datasets by default
-        if name not in self.datasets["active_datasets"]:
-            self.datasets["active_datasets"].append(name)
-        
-        self.save()
-        print(f"✓ Added dataset '{name}'")
-        print(f"  Location: {split_dir}")
-        print(f"  Metadata: {metadata}")
-    
-    def remove_dataset(self, name: str, delete_files: bool = False):
-        """Remove dataset from registry.
-        
-        Args:
-            name: Dataset name
-            delete_files: If True, also delete the actual files (dangerous!)
-        """
-        if name not in self.datasets["datasets"]:
-            print(f"⚠ Dataset '{name}' not found")
-            return
-        
-        dataset_info = self.datasets["datasets"][name]
-        
-        if delete_files:
-            import shutil
-            split_dir = dataset_info["split_dir"]
-            if os.path.exists(split_dir):
-                shutil.rmtree(split_dir)
-                print(f"✓ Deleted files: {split_dir}")
-        
-        del self.datasets["datasets"][name]
-        
-        if name in self.datasets["active_datasets"]:
-            self.datasets["active_datasets"].remove(name)
-        
-        self.save()
-        print(f"✓ Removed dataset '{name}' from registry")
-    
-    def set_active_datasets(self, names: list):
-        """Choose which datasets to use for training.
-        
-        Args:
-            names: List of dataset names to activate
-        """
-        for name in names:
-            if name not in self.datasets["datasets"]:
-                raise ValueError(f"Dataset '{name}' not found in registry")
-        
-        self.datasets["active_datasets"] = names
-        self.save()
-        print(f"✓ Active datasets: {names}")
-    
-    def get_active_split_dirs(self):
-        """Get split directories for all active datasets."""
-        return [
-            self.datasets["datasets"][name]["split_dir"]
-            for name in self.datasets["active_datasets"]
-        ]
-    
-    def get_dataset_info(self, name: str):
-        """Get information about a specific dataset."""
-        return self.datasets["datasets"].get(name)
-    
-    def list_datasets(self):
-        """Print all registered datasets."""
-        print("\n" + "="*70)
-        print("REGISTERED DATASETS")
-        print("="*70)
-        
-        if not self.datasets["datasets"]:
-            print("  No datasets registered yet.")
-            return
-        
-        for name, info in self.datasets["datasets"].items():
-            active = "✓ ACTIVE" if name in self.datasets["active_datasets"] else "  inactive"
-            print(f"\n{active} | {name}")
-            print(f"  Path: {info['split_dir']}")
-            print(f"  Added: {info['added_date']}")
-            if info['metadata']:
-                print(f"  Metadata: {info['metadata']}")
-            if info['trained_models']:
-                print(f"  Used in models: {info['trained_models']}")
-        
-        print("\n" + "="*70 + "\n")
-    
-    def record_training(self, model_type: str, model_path: str, datasets_used: list, metrics: dict):
-        """Record a training session in history.
-        
-        Args:
-            model_type: 'yolo', 'obb', or 'tracknet'
-            model_path: Path to saved weights
-            datasets_used: List of dataset names used
-            metrics: Dict of performance metrics
-        """
-        record = {
-            "timestamp": datetime.now().isoformat(),
-            "model_type": model_type,
-            "model_path": model_path,
-            "datasets": datasets_used,
-            "metrics": metrics
-        }
-        
-        self.datasets["training_history"].append(record)
-        
-        # Update each dataset's trained_models list
-        for ds_name in datasets_used:
-            if ds_name in self.datasets["datasets"]:
-                if model_path not in self.datasets["datasets"][ds_name]["trained_models"]:
-                    self.datasets["datasets"][ds_name]["trained_models"].append(model_path)
-        
-        self.save()
-
-
-# ══════════════════════════════════════════════════════════════════════════
-# UPDATED: Multi-Dataset YOLO Training
-# ══════════════════════════════════════════════════════════════════════════
-
-class YOLOTrainerV2:
-    """Enhanced YOLO trainer with multi-dataset support and incremental learning."""
+class YOLOTrainer:
+    """Train YOLOv8/v11 for shuttle detection (standard or OBB mode)."""
     
     @staticmethod
-    def create_combined_dataset_yaml(split_dirs: list, output_dir: str, use_obb: bool = False) -> str:
-        """Merge multiple datasets into one YOLO-compatible structure.
+    def create_dataset_yaml(split_dir: str, use_obb: bool = False) -> str:
+        """Generate dataset.yaml for YOLO training.
         
         Args:
-            split_dirs: List of paths to splits/ directories
-            output_dir: Where to create the combined dataset
-            use_obb: Use OBB labels instead of standard
+            split_dir: Path to splits/ directory (contains train/val/test)
+            use_obb: If True, use obb_labels; else use standard labels
         
         Returns:
             Path to generated dataset.yaml
         """
-        import shutil
+        yaml_path = os.path.join(split_dir, "dataset.yaml")
         
-        os.makedirs(output_dir, exist_ok=True)
-        
-        for split in ['train', 'val', 'test']:
-            combined_img_dir = os.path.join(output_dir, split, 'images')
-            combined_lbl_dir = os.path.join(output_dir, split, 'labels')
+        if use_obb:
+            # For OBB, YOLO expects labels in 'labels/' subdirectory
+            # Our OBB labels are in 'obb_labels/', so we need to link/copy them
+            import shutil
             
-            os.makedirs(combined_img_dir, exist_ok=True)
-            os.makedirs(combined_lbl_dir, exist_ok=True)
-            
-            # Merge all datasets
-            for i, split_dir in enumerate(split_dirs):
-                src_img_dir = os.path.join(split_dir, split, 'images')
-                src_lbl_dir = os.path.join(split_dir, split, 'obb_labels' if use_obb else 'labels')
+            for split in ['train', 'val', 'test']:
+                labels_dir = os.path.join(split_dir, split, 'labels')
+                obb_labels_dir = os.path.join(split_dir, split, 'obb_labels')
                 
-                if not os.path.exists(src_img_dir):
-                    print(f"⚠ Skipping {split_dir}/{split} - not found")
+                if not os.path.exists(obb_labels_dir):
+                    print(f"⚠ Warning: {split}/obb_labels not found")
                     continue
                 
-                # Copy with prefix to avoid name collisions
-                dataset_prefix = f"ds{i}_"
+                # Remove existing labels if it's pointing to wrong place
+                if os.path.exists(labels_dir):
+                    if os.path.islink(labels_dir):
+                        os.unlink(labels_dir)
+                    elif os.path.isdir(labels_dir):
+                        # Check if it's already our OBB labels
+                        try:
+                            if os.path.samefile(labels_dir, obb_labels_dir):
+                                continue  # Already correct
+                        except (OSError, ValueError):
+                            pass
+                        shutil.rmtree(labels_dir)
                 
-                for img_file in os.listdir(src_img_dir):
-                    if img_file.endswith(('.jpg', '.png', '.jpeg')):
-                        shutil.copy(
-                            os.path.join(src_img_dir, img_file),
-                            os.path.join(combined_img_dir, dataset_prefix + img_file)
-                        )
-                
-                if os.path.exists(src_lbl_dir):
-                    for lbl_file in os.listdir(src_lbl_dir):
-                        if lbl_file.endswith('.txt'):
-                            shutil.copy(
-                                os.path.join(src_lbl_dir, lbl_file),
-                                os.path.join(combined_lbl_dir, dataset_prefix + lbl_file)
-                            )
-                
-                print(f"  ✓ Merged dataset {i+1}/{len(split_dirs)} - {split} split")
+                # Create symlink or copy
+                try:
+                    # Try symlink first (Windows requires admin or dev mode)
+                    os.symlink(os.path.abspath(obb_labels_dir), 
+                             labels_dir, 
+                             target_is_directory=True)
+                    print(f"  ✓ Symlinked {split}/labels → obb_labels")
+                except (OSError, NotImplementedError):
+                    # Fall back to copying
+                    shutil.copytree(obb_labels_dir, labels_dir)
+                    print(f"  ✓ Copied {split}/obb_labels → labels")
         
-        # Create YAML
-        yaml_path = os.path.join(output_dir, "dataset.yaml")
+        # Build config
         config = {
-            "path": os.path.abspath(output_dir),
+            "path": os.path.abspath(split_dir),
             "train": "train/images",
-            "val": "val/images",
+            "val": "val/images", 
             "test": "test/images",
             "nc": 1,
             "names": ["shuttle"],
@@ -281,235 +96,384 @@ class YOLOTrainerV2:
         with open(yaml_path, "w") as f:
             yaml.dump(config, f, default_flow_style=False)
         
-        print(f"✓ Combined dataset created: {output_dir}")
+        print(f"✓ Created {yaml_path}")
         print(f"  Mode: {'OBB' if use_obb else 'Standard'}")
+        if use_obb:
+            print(f"  YOLO will use labels/ (pointing to obb_labels/)")
         return yaml_path
     
     @staticmethod
-    def train_incremental(
-        registry: DataRegistry,
+    def train_standard(
+        split_dir: str,
         output_dir: str,
-        model_type: str = "standard",  # 'standard' or 'obb'
+        model_size: str = "n",          # n, s, m, l, x
+        epochs: int = 10,
+        imgsz: int = 640,
+        batch: int = 8,
+        device: str = "0",
+        pretrained: bool = True,
+        yolo_version: str = "8",
+        resume_from: Optional[str] = None,      # Resume interrupted training
+        finetune_from: Optional[str] = None,    # Fine-tune from pre-trained weights
+        freeze_layers: int = 0,                 # Number of layers to freeze for fine-tuning
+        **kwargs
+    ):
+        """Train standard YOLOv8/v11 with axis-aligned boxes.
+        
+        Best for:
+          • Clear, slow shuttles
+          • Real-time inference requirements
+          • General-purpose detection
+        
+        Args:
+            resume_from: Resume interrupted training from checkpoint (continues from same epoch)
+            finetune_from: Start fine-tuning from pre-trained model (starts from epoch 0)
+            freeze_layers: For fine-tuning, number of backbone layers to freeze (0-10)
+        """
+        if not YOLO_AVAILABLE:
+            raise RuntimeError("ultralytics not installed. Run: pip install ultralytics")
+        
+        yaml_path = YOLOTrainer.create_dataset_yaml(split_dir, use_obb=False)
+
+        # Determine training mode
+        if resume_from and finetune_from:
+            raise ValueError("Cannot use both resume_from and finetune_from simultaneously")
+        
+        # Mode 1: Resume interrupted training
+        if resume_from:
+            if not os.path.exists(resume_from):
+                raise FileNotFoundError(f"Resume checkpoint not found: {resume_from}")
+            print(f"Resuming training from: {resume_from}")
+            model = YOLO(resume_from)
+            training_mode = "RESUME"
+            use_pretrained = False
+
+        # Mode 2: Fine-tune from existing weights
+        elif finetune_from:
+            if not os.path.exists(finetune_from):
+                raise FileNotFoundError(f"Fine-tune weights not found: {finetune_from}")
+            print(f"Fine-tuning from: {finetune_from}")
+            model = YOLO(finetune_from)
+            training_mode = "FINE-TUNE"
+            use_pretrained = False
+            
+            # Freeze layers if requested
+            if freeze_layers > 0:
+                print(f"  Freezing first {freeze_layers} layers")
+                for i, (name, param) in enumerate(model.model.named_parameters()):
+                    if i < freeze_layers:
+                        param.requires_grad = False
+
+        # Mode 3: Train from pretrained or scratch
+        elif pretrained:
+            try:
+                model_name = f"yolo{yolo_version}{model_size}.pt"
+                model = YOLO(model_name)
+                print(f"Using pretrained YOLOv{yolo_version}{model_size}")
+                training_mode = "PRETRAINED"
+            except Exception as e:
+                print(f"⚠ YOLOv{yolo_version} not available, falling back to YOLOv8")
+                model_name = f"yolov8{model_size}.pt"
+                model = YOLO(model_name)
+                yolo_version = "8"
+                training_mode = "PRETRAINED"
+            use_pretrained = True
+        else:
+            model_name = f"yolo{yolo_version}{model_size}.yaml"
+            model = YOLO(model_name)
+            training_mode = "FROM SCRATCH"
+            use_pretrained = False
+        
+        print(f"\n{'='*70}")
+        print(f"Training YOLOv{yolo_version}{model_size.upper()} - Standard Detection")
+        print(f"  Mode: {training_mode}")
+        if freeze_layers > 0:
+            print(f"  Frozen layers: {freeze_layers}")
+        print(f"{'='*70}")
+        
+        # Train
+        try:
+            results = model.train(
+                data=yaml_path,
+                epochs=epochs,
+                imgsz=imgsz,
+                batch=batch,
+                device=device,
+                project=output_dir,
+                name="yolo_standard",
+                exist_ok=True,
+                pretrained=use_pretrained,
+                resume=bool(resume_from),  # Only resume if resume_from is set
+                **kwargs
+            )
+        except Exception as e:
+            print(f"\n❌ Training failed: {str(e)}")
+            raise
+        
+        # Validate
+        try:
+            metrics = model.val()
+        except Exception as e:
+            print(f"⚠ Validation failed: {str(e)}")
+            metrics = None
+        
+        print(f"\n{'='*70}")
+        print("Training Complete - Standard YOLO")
+        print(f"{'='*70}")
+        print(f"  Best weights: {output_dir}/yolo_standard/weights/best.pt")
+        if metrics:
+            print(f"  mAP50: {metrics.box.map50:.4f}")
+            print(f"  mAP50-95: {metrics.box.map:.4f}")
+        print(f"{'='*70}\n")
+        
+        return model, metrics
+    
+    @staticmethod
+    def train_obb(
+        split_dir: str,
+        output_dir: str,
         model_size: str = "n",
         epochs: int = 10,
         imgsz: int = 640,
         batch: int = 8,
         device: str = "0",
-        pretrained_weights: str = None,  # Path to existing model to continue training
-        freeze_layers: int = 0,  # Number of layers to freeze (for transfer learning)
+        pretrained: bool = True,
         yolo_version: str = "8",
+        resume_from: Optional[str] = None,
+        finetune_from: Optional[str] = None,
+        freeze_layers: int = 0,
         **kwargs
     ):
-        """Train YOLO on multiple datasets with optional incremental learning.
+        """Train YOLOv8/v11-OBB with oriented bounding boxes.
+        
+        Best for:
+          • Motion-blurred shuttles
+          • Fast rallies with elongated streaks
+          • Precise orientation estimation
+        
+        Note: Requires YOLOv8/v11 OBB variant
         
         Args:
-            registry: DataRegistry instance with active datasets
-            output_dir: Where to save model
-            model_type: 'standard' or 'obb'
-            pretrained_weights: If provided, continue training from this model
-            freeze_layers: Freeze first N layers (useful when adding new data)
+            resume_from: Resume interrupted training from checkpoint
+            finetune_from: Start fine-tuning from pre-trained model
+            freeze_layers: For fine-tuning, number of backbone layers to freeze (0-10)
         """
         if not YOLO_AVAILABLE:
-            raise RuntimeError("ultralytics not installed.")
+            raise RuntimeError("ultralytics not installed. Run: pip install ultralytics")
         
-        # Get active datasets
-        split_dirs = registry.get_active_split_dirs()
-        if not split_dirs:
-            raise ValueError("No active datasets! Use registry.set_active_datasets([...])")
+        yaml_path = YOLOTrainer.create_dataset_yaml(split_dir, use_obb=True)
+
+        # Determine training mode
+        if resume_from and finetune_from:
+            raise ValueError("Cannot use both resume_from and finetune_from simultaneously")
         
-        print(f"\n{'='*70}")
-        print(f"Training YOLO on {len(split_dirs)} dataset(s)")
-        print(f"{'='*70}")
-        for i, sd in enumerate(split_dirs):
-            print(f"  {i+1}. {sd}")
-        print(f"{'='*70}\n")
+        # Mode 1: Resume interrupted training
+        if resume_from:
+            if not os.path.exists(resume_from):
+                raise FileNotFoundError(f"Resume checkpoint not found: {resume_from}")
+            print(f"Resuming training from: {resume_from}")
+            model = YOLO(resume_from)
+            training_mode = "RESUME"
+            use_pretrained = False
         
-        # Combine datasets
-        combined_dir = os.path.join(output_dir, "combined_dataset")
-        yaml_path = YOLOTrainerV2.create_combined_dataset_yaml(
-            split_dirs, combined_dir, use_obb=(model_type == "obb")
-        )
-        
-        # Load model
-        if pretrained_weights:
-            # Incremental learning from existing model
-            model = YOLO(pretrained_weights)
-            print(f"✓ Loading existing model: {pretrained_weights}")
+        # Mode 2: Fine-tune from existing weights
+        elif finetune_from:
+            if not os.path.exists(finetune_from):
+                raise FileNotFoundError(f"Fine-tune weights not found: {finetune_from}")
+            print(f"Fine-tuning from: {finetune_from}")
+            model = YOLO(finetune_from)
+            training_mode = "FINE-TUNE"
+            use_pretrained = False
             
+            # Freeze layers if requested
             if freeze_layers > 0:
-                # Freeze early layers to preserve learned features
+                print(f"  Freezing first {freeze_layers} layers")
                 for i, (name, param) in enumerate(model.model.named_parameters()):
                     if i < freeze_layers:
                         param.requires_grad = False
-                print(f"  Froze first {freeze_layers} layers")
-        else:
-            # Train from scratch or pretrained YOLO weights
-            if model_type == "obb":
+
+        # Mode 3: Train from pretrained or scratch
+        elif pretrained:
+            try:
                 model_name = f"yolo{yolo_version}{model_size}-obb.pt"
-            else:
-                model_name = f"yolo{yolo_version}{model_size}.pt"
-            
+                model = YOLO(model_name)
+                print(f"Using pretrained YOLOv{yolo_version}{model_size}-OBB")
+                training_mode = "PRETRAINED"
+            except Exception as e:
+                print(f"⚠ YOLOv{yolo_version}-OBB not available, falling back to YOLOv8-OBB")
+                model_name = f"yolov8{model_size}-obb.pt"
+                model = YOLO(model_name)
+                yolo_version = "8"
+                training_mode = "PRETRAINED"
+            use_pretrained = True
+        else:
+            model_name = f"yolo{yolo_version}{model_size}-obb.yaml"
             model = YOLO(model_name)
-            print(f"✓ Using pretrained {model_name}")
+            training_mode = "FROM SCRATCH"
+            use_pretrained = False
+            
+        print(f"\n{'='*70}")
+        print(f"Training YOLOv{yolo_version}{model_size.upper()}-OBB - Oriented Detection")
+        print(f"  Mode: {training_mode}")
+        if freeze_layers > 0:
+            print(f"  Frozen layers: {freeze_layers}")
+        print(f"{'='*70}")
         
-        # Train
-        run_name = f"yolo_{model_type}_multi" if not pretrained_weights else f"yolo_{model_type}_incremental"
+        try:
+            results = model.train(
+                data=yaml_path,
+                epochs=epochs,
+                imgsz=imgsz,
+                batch=batch,
+                device=device,
+                project=output_dir,
+                name="yolo_obb",
+                exist_ok=True,
+                pretrained=use_pretrained,
+                resume=bool(resume_from),
+                **kwargs
+            )
+        except Exception as e:
+            print(f"\n❌ Training failed: {str(e)}")
+            raise
         
-        results = model.train(
-            data=yaml_path,
-            epochs=epochs,
-            imgsz=imgsz,
-            batch=batch,
-            device=device,
-            project=output_dir,
-            name=run_name,
-            exist_ok=True,
-            **kwargs
-        )
-        
-        # Validate
-        metrics = model.val()
-        
-        # Record in registry
-        best_weights = os.path.join(output_dir, run_name, "weights", "best.pt")
-        registry.record_training(
-            model_type=f"yolo_{model_type}",
-            model_path=best_weights,
-            datasets_used=registry.datasets["active_datasets"],
-            metrics={
-                "map50": float(metrics.box.map50),
-                "map50_95": float(metrics.box.map)
-            }
-        )
+        try:
+            metrics = model.val()
+        except Exception as e:
+            print(f"⚠ Validation failed: {str(e)}")
+            metrics = None
         
         print(f"\n{'='*70}")
-        print(f"✓ Training Complete")
+        print("Training Complete - YOLOv11-OBB")
         print(f"{'='*70}")
-        print(f"  Weights: {best_weights}")
-        print(f"  mAP50: {metrics.box.map50:.4f}")
-        print(f"  mAP50-95: {metrics.box.map:.4f}")
+        print(f"  Best weights: {output_dir}/yolo_obb/weights/best.pt")
+        if metrics:
+            print(f"  mAP50: {metrics.box.map50:.4f}")
+            print(f"  mAP50-95: {metrics.box.map:.4f}")
         print(f"{'='*70}\n")
         
         return model, metrics
 
 
 # ══════════════════════════════════════════════════════════════════════════
-# UPDATED: Multi-Dataset TrackNet Training
+# 2. TrackNet Training (Temporal Heatmap Tracking)
 # ══════════════════════════════════════════════════════════════════════════
 
-class TrackNetDatasetV2(Dataset):
-    """TrackNet dataset supporting multiple data sources."""
+class TrackNetDataset(Dataset):
+    """Dataset for TrackNet training (multi-frame input → heatmap output)."""
     
-    def __init__(self, split_dirs: list, split: str = "train",
+    def __init__(self, split_dir: str, split: str = "train",
                  sequence_length: int = 3, img_size: int = 512):
         """
         Args:
-            split_dirs: List of paths to splits/ directories
+            split_dir: Path to splits/ directory
             split: 'train', 'val', or 'test'
-            sequence_length: Number of consecutive frames
+            sequence_length: Number of consecutive frames (default: 3)
             img_size: Input image size
         """
-        self.datasets = []
+        self.img_dir = os.path.join(split_dir, split, "images")
+        self.ann_path = os.path.join(split_dir, split, "annotations.json")
         self.sequence_length = sequence_length
         self.img_size = img_size
         
-        # Load all datasets
-        for split_dir in split_dirs:
-            img_dir = os.path.join(split_dir, split, "images")
-            ann_path = os.path.join(split_dir, split, "annotations.json")
-            
-            if not os.path.exists(ann_path):
-                print(f"⚠ Skipping {split_dir} - no annotations")
-                continue
-            
-            with open(ann_path) as f:
-                annotations = json.load(f)
-            
-            self.datasets.append({
-                "img_dir": img_dir,
-                "annotations": annotations,
-                "frames": sorted(annotations.keys())
-            })
+        if not os.path.exists(self.ann_path):
+            raise FileNotFoundError(f"Annotations not found: {self.ann_path}")
         
-        # Build valid sequences across all datasets
-        self.sequences = []
+        with open(self.ann_path) as f:
+            self.annotations = json.load(f)
         
-        for ds_idx, ds in enumerate(self.datasets):
-            frames = ds["frames"]
-            for i in range(len(frames) - sequence_length + 1):
-                if self._are_consecutive(frames[i:i + sequence_length]):
-                    self.sequences.append({
-                        "dataset_idx": ds_idx,
-                        "start_frame_idx": i
-                    })
+        self.frames = sorted(self.annotations.keys())
         
-        print(f"TrackNet {split}: {len(self.sequences)} sequences from {len(split_dirs)} dataset(s)")
+        # Only use frames where we have sequence_length consecutive frames
+        self.valid_indices = []
+        for i in range(len(self.frames) - sequence_length + 1):
+            # Check if frames are consecutive (frame_0001, frame_0002, frame_0003)
+            if self._are_consecutive(self.frames[i:i + sequence_length]):
+                self.valid_indices.append(i)
+        
+        if len(self.valid_indices) == 0:
+            raise ValueError(f"No valid sequences found in {split} split")
+        
+        print(f"TrackNet {split}: {len(self.valid_indices)} sequences "
+              f"(from {len(self.frames)} frames)")
     
     def _are_consecutive(self, frame_list):
         """Check if frame names are sequential."""
         import re
         numbers = []
         for frame in frame_list:
+            # Extract all numbers from filename
             m = re.findall(r'\d+', frame)
             if not m:
                 return False
+            # Use the last number (usually the frame number)
             numbers.append(int(m[-1]))
         
+        # Check if numbers are consecutive
         for i in range(len(numbers) - 1):
             if numbers[i + 1] != numbers[i] + 1:
                 return False
         return True
     
     def __len__(self):
-        return len(self.sequences)
+        return len(self.valid_indices)
     
     def __getitem__(self, idx):
-        seq_info = self.sequences[idx]
-        ds = self.datasets[seq_info["dataset_idx"]]
-        
-        start_idx = seq_info["start_frame_idx"]
-        sequence_frames = ds["frames"][start_idx:start_idx + self.sequence_length]
+        start_idx = self.valid_indices[idx]
+        sequence_frames = self.frames[start_idx:start_idx + self.sequence_length]
         
         # Load images
         images = []
         for frame_name in sequence_frames:
-            img_path = os.path.join(ds["img_dir"], frame_name)
+            img_path = os.path.join(self.img_dir, frame_name)
+            if not os.path.exists(img_path):
+                raise FileNotFoundError(f"Image not found: {img_path}")
+            
             img = cv2.imread(img_path)
+            if img is None:
+                raise ValueError(f"Failed to load image: {img_path}")
+            
             img = cv2.resize(img, (self.img_size, self.img_size))
             img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
             images.append(img)
         
-        images = np.array(images).transpose(0, 3, 1, 2)
+        images = np.array(images).transpose(0, 3, 1, 2)  # (T, C, H, W)
         images = images.astype(np.float32) / 255.0
         
-        # Generate heatmap
+        # Generate heatmap from last frame's annotation
         last_frame = sequence_frames[-1]
-        ann = ds["annotations"][last_frame]
+        ann = self.annotations[last_frame]
         
         heatmap = np.zeros((self.img_size, self.img_size), dtype=np.float32)
         
         if ann.get("visibility") in ("visible", "occluded") and "x" in ann:
-            orig_img = cv2.imread(os.path.join(ds["img_dir"], last_frame))
-            h_orig, w_orig = orig_img.shape[:2]
-            
-            x = int(ann["x"] * self.img_size / w_orig)
-            y = int(ann["y"] * self.img_size / h_orig)
-            
-            sigma = 5
-            for i in range(max(0, y - 3*sigma), min(self.img_size, y + 3*sigma)):
-                for j in range(max(0, x - 3*sigma), min(self.img_size, x + 3*sigma)):
-                    dist_sq = (i - y)**2 + (j - x)**2
-                    heatmap[i, j] = np.exp(-dist_sq / (2 * sigma**2))
+            # Get original image size to scale coordinates
+            orig_img_path = os.path.join(self.img_dir, last_frame)
+            orig_img = cv2.imread(orig_img_path)
+            if orig_img is not None:
+                h_orig, w_orig = orig_img.shape[:2]
+                
+                # Scale to img_size
+                x = int(ann["x"] * self.img_size / w_orig)
+                y = int(ann["y"] * self.img_size / h_orig)
+                
+                # Gaussian heatmap (sigma = 5 pixels)
+                sigma = 5
+                for i in range(max(0, y - 3*sigma), min(self.img_size, y + 3*sigma)):
+                    for j in range(max(0, x - 3*sigma), min(self.img_size, x + 3*sigma)):
+                        dist_sq = (i - y)**2 + (j - x)**2
+                        heatmap[i, j] = np.exp(-dist_sq / (2 * sigma**2))
         
         return torch.FloatTensor(images), torch.FloatTensor(heatmap)
 
 
 class TrackNet(nn.Module):
-    """TrackNet architecture (VGG-based encoder-decoder)."""
+    """TrackNet architecture (VGG-based encoder-decoder for heatmap prediction)."""
     
     def __init__(self, sequence_length=3):
         super().__init__()
         
+        # Encoder (VGG-style)
         self.conv1 = nn.Sequential(
             nn.Conv2d(sequence_length * 3, 64, 3, padding=1),
             nn.ReLU(),
@@ -534,6 +498,7 @@ class TrackNet(nn.Module):
             nn.MaxPool2d(2, 2)
         )
         
+        # Decoder
         self.deconv1 = nn.Sequential(
             nn.ConvTranspose2d(256, 128, 2, stride=2),
             nn.ReLU()
@@ -549,32 +514,37 @@ class TrackNet(nn.Module):
             nn.ReLU()
         )
         
+        # Output heatmap
         self.output = nn.Conv2d(32, 1, 1)
     
     def forward(self, x):
+        # x: (B, T, 3, H, W) → flatten temporal + channel dim
         B, T, C, H, W = x.shape
         x = x.reshape(B, T * C, H, W)
         
+        # Encode
         x1 = self.conv1(x)
         x2 = self.conv2(x1)
         x3 = self.conv3(x2)
         
+        # Decode
         x = self.deconv1(x3)
         x = self.deconv2(x)
         x = self.deconv3(x)
         
+        # Heatmap
         x = self.output(x)
         x = torch.sigmoid(x)
         
-        return x.squeeze(1)
+        return x.squeeze(1)  # (B, H, W)
 
 
-class TrackNetTrainerV2:
-    """Enhanced TrackNet trainer with multi-dataset and incremental learning."""
+class TrackNetTrainer:
+    """Train TrackNet for temporal shuttle tracking."""
     
     @staticmethod
     def train(
-        registry: DataRegistry,
+        split_dir: str,
         output_dir: str,
         sequence_length: int = 3,
         img_size: int = 512,
@@ -582,75 +552,131 @@ class TrackNetTrainerV2:
         batch_size: int = 8,
         lr: float = 1e-4,
         device: str = "cuda" if torch.cuda.is_available() else "cpu",
-        pretrained_weights: str = None,  # Continue from existing model
-        freeze_encoder: bool = False  # Freeze encoder for transfer learning
+        resume_from: Optional[str] = None,      # Resume interrupted training
+        finetune_from: Optional[str] = None,    # Fine-tune from pre-trained weights
+        freeze_encoder: bool = False            # Freeze encoder layers for fine-tuning
     ):
-        """Train TrackNet on multiple datasets.
+        """Train TrackNet model.
         
         Args:
-            registry: DataRegistry with active datasets
-            pretrained_weights: Path to existing .pth file to continue training
-            freeze_encoder: If True, only train decoder (for domain adaptation)
+            split_dir: Path to rally-aware splits
+            output_dir: Where to save model checkpoints
+            sequence_length: Number of input frames (default: 3)
+            img_size: Input image size
+            epochs: Training epochs
+            batch_size: Batch size
+            lr: Learning rate
+            device: 'cuda' or 'cpu'
+            resume_from: Resume interrupted training from checkpoint
+            finetune_from: Fine-tune from pre-trained model
+            freeze_encoder: If True, freeze encoder layers during fine-tuning
         """
         if not TORCH_AVAILABLE:
-            raise RuntimeError("PyTorch not installed.")
+            raise RuntimeError("PyTorch not installed. Run: pip install torch torchvision")
         
         os.makedirs(output_dir, exist_ok=True)
         
-        split_dirs = registry.get_active_split_dirs()
-        if not split_dirs:
-            raise ValueError("No active datasets!")
-        
-        print(f"\n{'='*70}")
-        print(f"Training TrackNet on {len(split_dirs)} dataset(s)")
-        print(f"{'='*70}")
+        # Determine training mode
+        if resume_from and finetune_from:
+            raise ValueError("Cannot use both resume_from and finetune_from simultaneously")
         
         # Datasets
-        train_dataset = TrackNetDatasetV2(split_dirs, "train", sequence_length, img_size)
-        val_dataset = TrackNetDatasetV2(split_dirs, "val", sequence_length, img_size)
+        try:
+            train_dataset = TrackNetDataset(split_dir, "train", sequence_length, img_size)
+            val_dataset = TrackNetDataset(split_dir, "val", sequence_length, img_size)
+        except Exception as e:
+            print(f"❌ Failed to load datasets: {str(e)}")
+            raise
         
-        train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=4)
-        val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=4)
+        train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, 
+                                 num_workers=4, pin_memory=True if device == "cuda" else False)
+        val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, 
+                               num_workers=4, pin_memory=True if device == "cuda" else False)
         
         # Model
         model = TrackNet(sequence_length).to(device)
-        
-        if pretrained_weights:
-            checkpoint = torch.load(pretrained_weights, map_location=device)
-            model.load_state_dict(checkpoint['model_state_dict'])
-            print(f"✓ Loaded pretrained weights: {pretrained_weights}")
-            
-            if freeze_encoder:
-                # Freeze conv layers, only train decoder
-                for param in model.conv1.parameters():
-                    param.requires_grad = False
-                for param in model.conv2.parameters():
-                    param.requires_grad = False
-                for param in model.conv3.parameters():
-                    param.requires_grad = False
-                print("  Froze encoder layers")
-        
-        optimizer = optim.Adam(filter(lambda p: p.requires_grad, model.parameters()), lr=lr)
+        optimizer = optim.Adam(model.parameters(), lr=lr)
         criterion = nn.MSELoss()
         
+        start_epoch = 0
         best_val_loss = float('inf')
+        training_mode = "FROM SCRATCH"
         
-        for epoch in range(epochs):
+        # Mode 1: Resume interrupted training
+        if resume_from:
+            if not os.path.exists(resume_from):
+                raise FileNotFoundError(f"Resume checkpoint not found: {resume_from}")
+            
+            print(f"  Loading checkpoint from: {resume_from}")
+            checkpoint = torch.load(resume_from, map_location=device)
+            model.load_state_dict(checkpoint['model_state_dict'])
+            optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+            start_epoch = checkpoint.get('epoch', 0) + 1
+            best_val_loss = checkpoint.get('val_loss', float('inf'))
+            training_mode = "RESUME"
+            print(f"  Resuming from epoch {start_epoch}")
+        
+        # Mode 2: Fine-tune from pre-trained weights
+        elif finetune_from:
+            if not os.path.exists(finetune_from):
+                raise FileNotFoundError(f"Fine-tune checkpoint not found: {finetune_from}")
+            
+            print(f"  Loading pre-trained weights from: {finetune_from}")
+            checkpoint = torch.load(finetune_from, map_location=device)
+            model.load_state_dict(checkpoint['model_state_dict'])
+            training_mode = "FINE-TUNE"
+            
+            # Freeze encoder if requested
+            if freeze_encoder:
+                print(f"  Freezing encoder layers")
+                for name, param in model.named_parameters():
+                    if 'conv1' in name or 'conv2' in name or 'conv3' in name:
+                        param.requires_grad = False
+                
+                # Re-create optimizer with only trainable parameters
+                optimizer = optim.Adam(filter(lambda p: p.requires_grad, model.parameters()), lr=lr)
+            
+            print(f"  Starting fine-tuning from epoch 0")
+        
+        print(f"\n{'='*70}")
+        print("Training TrackNet")
+        print(f"  Mode: {training_mode}")
+        if freeze_encoder:
+            print(f"  Encoder: FROZEN")
+        print(f"{'='*70}")
+        print(f"  Device: {device}")
+        print(f"  Sequence length: {sequence_length}")
+        print(f"  Image size: {img_size}")
+        print(f"  Train sequences: {len(train_dataset)}")
+        print(f"  Val sequences: {len(val_dataset)}")
+        print(f"{'='*70}\n")
+        
+        for epoch in range(start_epoch, start_epoch + epochs):
             # Train
             model.train()
             train_loss = 0.0
             
-            for images, heatmaps in train_loader:
-                images = images.to(device)
-                heatmaps = heatmaps.to(device)
-                
-                optimizer.zero_grad()
-                outputs = model(images)
-                loss = criterion(outputs, heatmaps)
-                loss.backward()
-                optimizer.step()
-                
-                train_loss += loss.item()
+            try:
+                for batch_idx, (images, heatmaps) in enumerate(train_loader):
+                    images = images.to(device)
+                    heatmaps = heatmaps.to(device)
+                    
+                    optimizer.zero_grad()
+                    outputs = model(images)
+                    loss = criterion(outputs, heatmaps)
+                    loss.backward()
+                    optimizer.step()
+                    
+                    train_loss += loss.item()
+                    
+                    # Print progress every 10 batches
+                    if (batch_idx + 1) % 10 == 0:
+                        print(f"  Epoch {epoch+1} [{batch_idx+1}/{len(train_loader)}] "
+                              f"Loss: {loss.item():.6f}")
+            
+            except Exception as e:
+                print(f"❌ Training error at epoch {epoch+1}: {str(e)}")
+                raise
             
             train_loss /= len(train_loader)
             
@@ -658,40 +684,50 @@ class TrackNetTrainerV2:
             model.eval()
             val_loss = 0.0
             
-            with torch.no_grad():
-                for images, heatmaps in val_loader:
-                    images = images.to(device)
-                    heatmaps = heatmaps.to(device)
-                    outputs = model(images)
-                    loss = criterion(outputs, heatmaps)
-                    val_loss += loss.item()
+            try:
+                with torch.no_grad():
+                    for images, heatmaps in val_loader:
+                        images = images.to(device)
+                        heatmaps = heatmaps.to(device)
+                        outputs = model(images)
+                        loss = criterion(outputs, heatmaps)
+                        val_loss += loss.item()
+            except Exception as e:
+                print(f"⚠ Validation error at epoch {epoch+1}: {str(e)}")
+                val_loss = float('inf')
             
-            val_loss /= len(val_loader)
+            val_loss /= len(val_loader) if len(val_loader) > 0 else 1
             
-            print(f"Epoch {epoch+1}/{epochs}  Train: {train_loss:.6f}  Val: {val_loss:.6f}")
+            print(f"Epoch {epoch+1}/{start_epoch + epochs}  "
+                  f"Train Loss: {train_loss:.6f}  Val Loss: {val_loss:.6f}")
             
+            # Save checkpoint every epoch
+            checkpoint_path = os.path.join(output_dir, f'tracknet_epoch_{epoch+1}.pth')
+            torch.save({
+                'epoch': epoch,
+                'model_state_dict': model.state_dict(),
+                'optimizer_state_dict': optimizer.state_dict(),
+                'train_loss': train_loss,
+                'val_loss': val_loss,
+            }, checkpoint_path)
+            
+            # Save best model
             if val_loss < best_val_loss:
                 best_val_loss = val_loss
-                save_path = os.path.join(output_dir, 'tracknet_best.pth')
+                best_path = os.path.join(output_dir, 'tracknet_best.pth')
                 torch.save({
                     'epoch': epoch,
                     'model_state_dict': model.state_dict(),
                     'optimizer_state_dict': optimizer.state_dict(),
+                    'train_loss': train_loss,
                     'val_loss': val_loss,
-                }, save_path)
-                print(f"  → Saved best model")
-        
-        # Record in registry
-        registry.record_training(
-            model_type="tracknet",
-            model_path=save_path,
-            datasets_used=registry.datasets["active_datasets"],
-            metrics={"val_loss": float(best_val_loss)}
-        )
+                }, best_path)
+                print(f"  → Saved best model (val_loss: {val_loss:.6f})")
         
         print(f"\n{'='*70}")
-        print("✓ TrackNet Training Complete")
-        print(f"  Weights: {save_path}")
+        print("TrackNet Training Complete")
+        print(f"{'='*70}")
+        print(f"  Best weights: {output_dir}/tracknet_best.pth")
         print(f"  Best val loss: {best_val_loss:.6f}")
         print(f"{'='*70}\n")
         
@@ -699,401 +735,371 @@ class TrackNetTrainerV2:
 
 
 # ══════════════════════════════════════════════════════════════════════════
-# UPDATED: Adaptive Tracking with Domain Classification
+# 3. Inference on New Videos
 # ══════════════════════════════════════════════════════════════════════════
 
-class AdaptiveShuttleTracker:
-    """Intelligent tracker that selects best model based on video conditions."""
+class ShuttleTracker:
+    """Unified inference for YOLO, TrackNet, and hybrid tracking."""
     
-    def __init__(self, model_registry_path: str = "./model_registry.json"):
+    def __init__(self, yolo_weights=None, obb_weights=None, tracknet_weights=None,
+                 device="cuda" if torch.cuda.is_available() else "cpu"):
         """
         Args:
-            model_registry_path: JSON file mapping conditions → best models
+            yolo_weights: Path to YOLO standard weights
+            obb_weights: Path to YOLO-OBB weights
+            tracknet_weights: Path to TrackNet weights
+            device: 'cuda' or 'cpu'
         """
-        self.model_registry = self._load_model_registry(model_registry_path)
-        self.loaded_models = {}  # Cache for loaded models
-        self.device = "cuda" if torch.cuda.is_available() else "cpu"
-    
-    def _load_model_registry(self, path):
-        """Load or create model registry."""
-        if os.path.exists(path):
-            with open(path) as f:
-                return json.load(f)
+        self.device = device
+        self.yolo_model = None
+        self.obb_model = None
+        self.tracknet_model = None
         
-        # Default registry template
-        return {
-            "models": {
-                "yolo_indoor": None,
-                "yolo_outdoor": None,
-                "obb_fast": None,
-                "obb_blur": None,
-                "tracknet_occlusion": None,
-                "tracknet_default": None
-            },
-            "selection_rules": {
-                "indoor_slow": "yolo_indoor",
-                "indoor_fast": "obb_fast",
-                "outdoor_slow": "yolo_outdoor",
-                "outdoor_fast": "obb_blur",
-                "occlusion_heavy": "tracknet_occlusion",
-                "default": "tracknet_default"
-            }
-        }
+        if yolo_weights:
+            if not YOLO_AVAILABLE:
+                raise RuntimeError("ultralytics not installed. Cannot load YOLO model.")
+            if not os.path.exists(yolo_weights):
+                raise FileNotFoundError(f"YOLO weights not found: {yolo_weights}")
+            self.yolo_model = YOLO(yolo_weights)
+            print(f"✓ Loaded YOLO: {yolo_weights}")
+        
+        if obb_weights:
+            if not YOLO_AVAILABLE:
+                raise RuntimeError("ultralytics not installed. Cannot load OBB model.")
+            if not os.path.exists(obb_weights):
+                raise FileNotFoundError(f"OBB weights not found: {obb_weights}")
+            self.obb_model = YOLO(obb_weights)
+            print(f"✓ Loaded YOLO-OBB: {obb_weights}")
+        
+        if tracknet_weights:
+            if not TORCH_AVAILABLE:
+                raise RuntimeError("PyTorch not installed. Cannot load TrackNet model.")
+            if not os.path.exists(tracknet_weights):
+                raise FileNotFoundError(f"TrackNet weights not found: {tracknet_weights}")
+            checkpoint = torch.load(tracknet_weights, map_location=device)
+            self.tracknet_model = TrackNet(sequence_length=3).to(device)
+            self.tracknet_model.load_state_dict(checkpoint['model_state_dict'])
+            self.tracknet_model.eval()
+            print(f"✓ Loaded TrackNet: {tracknet_weights}")
+        
+        self.frame_buffer = deque(maxlen=3)  # For TrackNet multi-frame input
     
-    def register_model(self, condition: str, model_path: str, model_type: str):
-        """Register a model for specific conditions.
+    def track_video(self, video_path: str, output_path: str,
+                    mode: str = "hybrid", conf_threshold: float = 0.25,
+                    show_trail: bool = True, trail_length: int = 30):
+        """Track shuttle in video and save annotated output.
         
         Args:
-            condition: e.g., 'indoor_fast', 'outdoor_slow', 'heavy_blur'
-            model_path: Path to model weights
-            model_type: 'yolo', 'obb', or 'tracknet'
+            video_path: Input video path
+            output_path: Output video path
+            mode: 'yolo' | 'obb' | 'tracknet' | 'hybrid'
+            conf_threshold: Confidence threshold for YOLO detections
+            show_trail: Show shuttle trajectory trail
+            trail_length: Number of past positions to show
         """
-        self.model_registry["models"][condition] = {
-            "path": model_path,
-            "type": model_type
-        }
-        print(f"✓ Registered {model_type} for condition: {condition}")
-    
-    def detect_video_conditions(self, video_path: str, sample_frames: int = 30):
-        """Auto-detect video characteristics.
-        
-        Returns:
-            dict with 'lighting', 'speed', 'blur_level', 'occlusion_risk'
-        """
-        cap = cv2.VideoCapture(video_path)
-        
-        brightnesses = []
-        motion_magnitudes = []
-        blur_scores = []
-        
-        prev_gray = None
-        frame_count = 0
-        
-        while frame_count < sample_frames:
-            ret, frame = cap.read()
-            if not ret:
-                break
-            
-            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-            
-            # Brightness
-            brightnesses.append(gray.mean())
-            
-            # Motion magnitude (optical flow)
-            if prev_gray is not None:
-                flow = cv2.calcOpticalFlowFarneback(
-                    prev_gray, gray, None, 0.5, 3, 15, 3, 5, 1.2, 0
-                )
-                mag = np.sqrt(flow[..., 0]**2 + flow[..., 1]**2).mean()
-                motion_magnitudes.append(mag)
-            
-            # Blur detection (Laplacian variance)
-            laplacian_var = cv2.Laplacian(gray, cv2.CV_64F).var()
-            blur_scores.append(laplacian_var)
-            
-            prev_gray = gray
-            frame_count += 1
-        
-        cap.release()
-        
-        # Analyze results
-        avg_brightness = np.mean(brightnesses)
-        avg_motion = np.mean(motion_magnitudes) if motion_magnitudes else 0
-        avg_blur = np.mean(blur_scores)
-        
-        conditions = {
-            "lighting": "indoor" if avg_brightness < 120 else "outdoor",
-            "speed": "fast" if avg_motion > 5 else "slow",
-            "blur_level": "high" if avg_blur < 100 else "low",
-            "occlusion_risk": "high" if avg_motion > 10 else "low"
-        }
-        
-        print(f"\n{'='*70}")
-        print("AUTO-DETECTED VIDEO CONDITIONS")
-        print(f"{'='*70}")
-        print(f"  Lighting: {conditions['lighting']} (brightness: {avg_brightness:.1f})")
-        print(f"  Speed: {conditions['speed']} (motion: {avg_motion:.2f})")
-        print(f"  Blur: {conditions['blur_level']} (sharpness: {avg_blur:.1f})")
-        print(f"  Occlusion risk: {conditions['occlusion_risk']}")
-        print(f"{'='*70}\n")
-        
-        return conditions
-    
-    def select_best_model(self, conditions: dict):
-        """Choose best model based on detected conditions.
-        
-        Args:
-            conditions: Output from detect_video_conditions()
-        
-        Returns:
-            (model_path, model_type)
-        """
-        # Build condition key
-        key = f"{conditions['lighting']}_{conditions['speed']}"
-        
-        # Check if we have a specific model for this
-        if key in self.model_registry["selection_rules"]:
-            model_name = self.model_registry["selection_rules"][key]
-        elif conditions['occlusion_risk'] == 'high':
-            model_name = "tracknet_occlusion"
-        else:
-            model_name = "tracknet_default"
-        
-        model_info = self.model_registry["models"].get(model_name)
-        
-        if model_info and model_info["path"]:
-            print(f"✓ Selected model: {model_name}")
-            print(f"  Type: {model_info['type']}")
-            print(f"  Path: {model_info['path']}")
-            return model_info["path"], model_info["type"]
-        else:
-            raise ValueError(f"No model registered for condition: {model_name}")
-    
-    def track_video_adaptive(self, video_path: str, output_path: str,
-                            auto_detect: bool = True, manual_conditions: dict = None,
-                            conf_threshold: float = 0.25):
-        """Track video with automatic model selection.
-        
-        Args:
-            video_path: Input video
-            output_path: Output annotated video
-            auto_detect: Auto-detect conditions (recommended)
-            manual_conditions: Override auto-detection with manual conditions
-            conf_threshold: Detection confidence threshold
-        """
-        # Detect or use manual conditions
-        if auto_detect:
-            conditions = self.detect_video_conditions(video_path)
-        else:
-            conditions = manual_conditions or {"lighting": "indoor", "speed": "medium"}
-        
-        # Select best model
-        model_path, model_type = self.select_best_model(conditions)
-        
-        # Load model if not cached
-        if model_path not in self.loaded_models:
-            if model_type in ["yolo", "obb"]:
-                if YOLO_AVAILABLE:
-                    self.loaded_models[model_path] = YOLO(model_path)
-                else:
-                    raise RuntimeError("YOLO not available")
-            
-            elif model_type == "tracknet":
-                if TORCH_AVAILABLE:
-                    checkpoint = torch.load(model_path, map_location=self.device)
-                    model = TrackNet(sequence_length=3).to(self.device)
-                    model.load_state_dict(checkpoint['model_state_dict'])
-                    model.eval()
-                    self.loaded_models[model_path] = model
-                else:
-                    raise RuntimeError("PyTorch not available")
-        
-        # Run tracking
-        model = self.loaded_models[model_path]
+        if not os.path.exists(video_path):
+            raise FileNotFoundError(f"Video not found: {video_path}")
         
         cap = cv2.VideoCapture(video_path)
+        if not cap.isOpened():
+            raise ValueError(f"Failed to open video: {video_path}")
+        
         fps = int(cap.get(cv2.CAP_PROP_FPS))
         width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        
+        # Validate mode
+        if mode == "yolo" and not self.yolo_model:
+            raise ValueError("YOLO mode requires yolo_weights")
+        if mode == "obb" and not self.obb_model:
+            raise ValueError("OBB mode requires obb_weights")
+        if mode == "tracknet" and not self.tracknet_model:
+            raise ValueError("TrackNet mode requires tracknet_weights")
+        if mode == "hybrid" and not (self.yolo_model or self.obb_model or self.tracknet_model):
+            raise ValueError("Hybrid mode requires at least one model")
         
         fourcc = cv2.VideoWriter_fourcc(*'mp4v')
         out = cv2.VideoWriter(output_path, fourcc, fps, (width, height))
         
-        frame_buffer = deque(maxlen=3)
+        trail = deque(maxlen=trail_length)
         frame_idx = 0
         
-        print(f"\nTracking video...")
+        print(f"\nTracking video: {video_path}")
+        print(f"  Mode: {mode}")
+        print(f"  FPS: {fps}  Resolution: {width}x{height}  Frames: {total_frames}")
         
-        while True:
-            ret, frame = cap.read()
-            if not ret:
-                break
-            
-            # Detection logic based on model type
-            if model_type in ["yolo", "obb"]:
-                position = self._detect_yolo(frame, model, conf_threshold, is_obb=(model_type == "obb"))
-            else:  # tracknet
-                frame_buffer.append(frame.copy())
-                position = self._detect_tracknet(frame, frame_buffer, model)
-            
-            # Visualize
-            if position:
-                x, y = int(position[0]), int(position[1])
-                cv2.circle(frame, (x, y), 12, (0, 255, 0), 2)
-                cv2.putText(frame, f"({x}, {y})", (x+15, y-15),
-                           cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
-            
-            cv2.putText(frame, f"Model: {model_type.upper()} | Frame: {frame_idx}",
-                       (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-            
-            out.write(frame)
-            frame_idx += 1
-            
-            if frame_idx % 100 == 0:
-                print(f"  Processed {frame_idx} frames...")
+        try:
+            while True:
+                ret, frame = cap.read()
+                if not ret:
+                    break
+                
+                # Get detection/prediction
+                position = None
+                
+                if mode == "yolo" and self.yolo_model:
+                    position = self._detect_yolo(frame, self.yolo_model, conf_threshold)
+                
+                elif mode == "obb" and self.obb_model:
+                    position = self._detect_yolo(frame, self.obb_model, conf_threshold, is_obb=True)
+                
+                elif mode == "tracknet" and self.tracknet_model:
+                    position = self._detect_tracknet(frame)
+                
+                elif mode == "hybrid":
+                    # Use YOLO for detection, TrackNet for refinement
+                    yolo_pos = None
+                    if self.obb_model:
+                        yolo_pos = self._detect_yolo(frame, self.obb_model, conf_threshold, is_obb=True)
+                    elif self.yolo_model:
+                        yolo_pos = self._detect_yolo(frame, self.yolo_model, conf_threshold)
+                    
+                    tracknet_pos = self._detect_tracknet(frame) if self.tracknet_model else None
+                    
+                    # Fusion: if both agree (within 50px), use TrackNet (more precise)
+                    # Otherwise use YOLO (more robust)
+                    if yolo_pos and tracknet_pos:
+                        dist = np.sqrt((yolo_pos[0] - tracknet_pos[0])**2 +
+                                      (yolo_pos[1] - tracknet_pos[1])**2)
+                        position = tracknet_pos if dist < 50 else yolo_pos
+                    else:
+                        position = yolo_pos or tracknet_pos
+                
+                # Visualize
+                if position:
+                    x, y = int(position[0]), int(position[1])
+                    trail.append((x, y))
+                    
+                    # Draw current position
+                    cv2.circle(frame, (x, y), 12, (0, 255, 0), 2)
+                    
+                    # Draw trail
+                    if show_trail and len(trail) > 1:
+                        for i in range(1, len(trail)):
+                            alpha = i / len(trail)
+                            color = (0, int(255 * alpha), 0)
+                            thickness = max(1, int(2 * alpha))
+                            cv2.line(frame, trail[i-1], trail[i], color, thickness)
+                
+                # Info overlay
+                cv2.putText(frame, f"Frame: {frame_idx}/{total_frames}  Mode: {mode.upper()}",
+                           (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+                if position:
+                    cv2.putText(frame, f"Position: ({int(position[0])}, {int(position[1])})",
+                               (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+                
+                out.write(frame)
+                frame_idx += 1
+                
+                if frame_idx % 100 == 0:
+                    print(f"  Processed {frame_idx}/{total_frames} frames...")
         
-        cap.release()
-        out.release()
+        except Exception as e:
+            print(f"❌ Error during tracking: {str(e)}")
+            raise
+        finally:
+            cap.release()
+            out.release()
         
         print(f"✓ Tracking complete → {output_path}")
+        print(f"  Frames processed: {frame_idx}")
     
     def _detect_yolo(self, frame, model, conf_threshold, is_obb=False):
-        """YOLO detection logic."""
-        results = model(frame, conf=conf_threshold, verbose=False)
-        r = results[0]
+        """Run YOLO detection on frame."""
+        try:
+            results = model(frame, conf=conf_threshold, verbose=False)
+            r = results[0]
+
+            if is_obb:
+                if not hasattr(r, "obb") or r.obb is None or r.obb.conf is None:
+                    return None
+
+                confs = r.obb.conf.cpu().numpy()
+                if len(confs) == 0:
+                    return None
+
+                boxes = r.obb.xyxyxyxy.cpu().numpy()
+                best_idx = np.argmax(confs)
+                corners = boxes[best_idx]
+
+                cx = corners[:, 0].mean()
+                cy = corners[:, 1].mean()
+                return (cx, cy)
+
+            else:
+                if r.boxes is None or r.boxes.conf is None:
+                    return None
+
+                confs = r.boxes.conf.cpu().numpy()
+                if len(confs) == 0:
+                    return None
+
+                boxes = r.boxes.xyxy.cpu().numpy()
+                best_idx = np.argmax(confs)
+                x1, y1, x2, y2 = boxes[best_idx]
+                return ((x1 + x2) / 2, (y1 + y2) / 2)
         
-        if is_obb:
-            if not hasattr(r, "obb") or r.obb is None or r.obb.conf is None:
-                return None
-            confs = r.obb.conf.cpu().numpy()
-            if len(confs) == 0:
-                return None
-            boxes = r.obb.xyxyxyxy.cpu().numpy()
-            best_idx = np.argmax(confs)
-            corners = boxes[best_idx]
-            return (corners[:, 0].mean(), corners[:, 1].mean())
-        else:
-            if r.boxes is None or r.boxes.conf is None:
-                return None
-            confs = r.boxes.conf.cpu().numpy()
-            if len(confs) == 0:
-                return None
-            boxes = r.boxes.xyxy.cpu().numpy()
-            best_idx = np.argmax(confs)
-            x1, y1, x2, y2 = boxes[best_idx]
-            return ((x1 + x2) / 2, (y1 + y2) / 2)
+        except Exception as e:
+            print(f"⚠ YOLO detection error: {str(e)}")
+            return None
     
-    def _detect_tracknet(self, frame, frame_buffer, model):
-        """TrackNet detection logic."""
-        if len(frame_buffer) < 3:
+    def _detect_tracknet(self, frame):
+        """Run TrackNet prediction on frame."""
+        if self.tracknet_model is None:
             return None
         
-        frames = list(frame_buffer)
-        img_size = 512
+        try:
+            # Add to buffer
+            self.frame_buffer.append(frame.copy())
+            
+            if len(self.frame_buffer) < 3:
+                return None
+            
+            # Prepare input
+            frames = list(self.frame_buffer)
+            img_size = 512
+            
+            images = []
+            for f in frames:
+                img = cv2.resize(f, (img_size, img_size))
+                img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+                images.append(img)
+            
+            images = np.array(images).transpose(0, 3, 1, 2).astype(np.float32) / 255.0
+            images = torch.FloatTensor(images).unsqueeze(0).to(self.device)
+            
+            # Predict
+            with torch.no_grad():
+                heatmap = self.tracknet_model(images).cpu().numpy()[0]
+            
+            # Find peak
+            y_max, x_max = np.unravel_index(heatmap.argmax(), heatmap.shape)
+            
+            # Scale back to original frame size
+            h, w = frame.shape[:2]
+            x = x_max * w / img_size
+            y = y_max * h / img_size
+            
+            # Only return if heatmap confidence is high
+            if heatmap[y_max, x_max] > 0.5:
+                return (x, y)
+            return None
         
-        images = []
-        for f in frames:
-            img = cv2.resize(f, (img_size, img_size))
-            img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-            images.append(img)
-        
-        images = np.array(images).transpose(0, 3, 1, 2).astype(np.float32) / 255.0
-        images = torch.FloatTensor(images).unsqueeze(0).to(self.device)
-        
-        with torch.no_grad():
-            heatmap = model(images).cpu().numpy()[0]
-        
-        y_max, x_max = np.unravel_index(heatmap.argmax(), heatmap.shape)
-        
-        h, w = frame.shape[:2]
-        x = x_max * w / img_size
-        y = y_max * h / img_size
-        
-        if heatmap[y_max, x_max] > 0.5:
-            return (x, y)
-        return None
+        except Exception as e:
+            print(f"⚠ TrackNet detection error: {str(e)}")
+            return None
 
 
 # ══════════════════════════════════════════════════════════════════════════
-# CLI Interface
+# 4. Main Entry Point
 # ══════════════════════════════════════════════════════════════════════════
 
 if __name__ == "__main__":
     import argparse
     
-    parser = argparse.ArgumentParser(description="Incremental shuttle tracking system")
+    parser = argparse.ArgumentParser(description="Train and track shuttle")
+    parser.add_argument("--action", choices=["train-yolo", "train-obb", "train-tracknet", "track"],
+                       required=True)
     
-    subparsers = parser.add_subparsers(dest="command", help="Commands")
+    # Training args
+    parser.add_argument("--split-dir", help="Path to splits/ directory")
+    parser.add_argument("--output-dir", help="Where to save trained models")
+    parser.add_argument("--model-size", default="n", choices=["n", "s", "m", "l", "x"])
+    parser.add_argument("--epochs", type=int, default=10)
+    parser.add_argument("--batch", type=int, default=8)
+    parser.add_argument("--imgsz", type=int, default=640)
+    parser.add_argument("--device", default="0")
+    parser.add_argument("--yolo-version", default="8", choices=["8", "11"],
+                       help="YOLO version to use (default: 8, more stable)")
     
-    # Dataset management
-    dataset_parser = subparsers.add_parser("dataset", help="Manage datasets")
-    dataset_parser.add_argument("action", choices=["add", "remove", "list", "activate"])
-    dataset_parser.add_argument("--name", help="Dataset name")
-    dataset_parser.add_argument("--split-dir", help="Path to splits/ directory")
-    dataset_parser.add_argument("--metadata", type=json.loads, help="JSON metadata")
-    dataset_parser.add_argument("--active", nargs="+", help="List of active dataset names")
+    # Fine-tuning args
+    parser.add_argument("--resume-from", help="Resume interrupted training from checkpoint")
+    parser.add_argument("--finetune-from", help="Fine-tune from pre-trained weights")
+    parser.add_argument("--freeze-layers", type=int, default=0,
+                       help="Number of layers to freeze for YOLO fine-tuning (0-10)")
+    parser.add_argument("--freeze-encoder", action="store_true",
+                       help="Freeze encoder layers for TrackNet fine-tuning")
     
-    # Training
-    train_parser = subparsers.add_parser("train", help="Train models")
-    train_parser.add_argument("--model-type", choices=["yolo", "obb", "tracknet"], required=True)
-    train_parser.add_argument("--output-dir", required=True)
-    train_parser.add_argument("--epochs", type=int, default=10)
-    train_parser.add_argument("--batch", type=int, default=8)
-    train_parser.add_argument("--pretrained-weights", help="Continue from existing model")
-    train_parser.add_argument("--freeze-layers", type=int, default=0, help="Freeze N layers")
-    train_parser.add_argument("--device", default="0")
+    # TrackNet specific
+    parser.add_argument("--sequence-length", type=int, default=3)
+    parser.add_argument("--tracknet-img-size", type=int, default=512)
+    parser.add_argument("--lr", type=float, default=1e-4, help="Learning rate for TrackNet")
     
-    # Tracking
-    track_parser = subparsers.add_parser("track", help="Track shuttle in video")
-    track_parser.add_argument("--video", required=True)
-    track_parser.add_argument("--output", required=True)
-    track_parser.add_argument("--adaptive", action="store_true", help="Auto-select best model")
-    track_parser.add_argument("--model-path", help="Manual model selection")
-    track_parser.add_argument("--model-type", choices=["yolo", "obb", "tracknet"])
+    # Inference args
+    parser.add_argument("--video", help="Input video for tracking")
+    parser.add_argument("--output-video", help="Output tracked video")
+    parser.add_argument("--yolo-weights", help="Path to YOLO weights")
+    parser.add_argument("--obb-weights", help="Path to OBB weights")
+    parser.add_argument("--tracknet-weights", help="Path to TrackNet weights")
+    parser.add_argument("--mode", default="hybrid", choices=["yolo", "obb", "tracknet", "hybrid"])
+    parser.add_argument("--conf", type=float, default=0.25)
     
     args = parser.parse_args()
     
-    # Execute commands
-    if args.command == "dataset":
-        registry = DataRegistry()
-        
-        if args.action == "add":
-            registry.add_dataset(args.name, args.split_dir, args.metadata)
-        
-        elif args.action == "remove":
-            registry.remove_dataset(args.name)
-        
-        elif args.action == "list":
-            registry.list_datasets()
-        
-        elif args.action == "activate":
-            registry.set_active_datasets(args.active)
-    
-    elif args.command == "train":
-        registry = DataRegistry()
-        
-        if args.model_type == "yolo":
-            YOLOTrainerV2.train_incremental(
-                registry=registry,
+    try:
+        if args.action == "train-yolo":
+            YOLOTrainer.train_standard(
+                split_dir=args.split_dir,
                 output_dir=args.output_dir,
-                model_type="standard",
+                model_size=args.model_size,
                 epochs=args.epochs,
+                imgsz=args.imgsz,
                 batch=args.batch,
-                pretrained_weights=args.pretrained_weights,
-                freeze_layers=args.freeze_layers,
-                device=args.device
+                device=args.device,
+                yolo_version=args.yolo_version,
+                resume_from=args.resume_from,
+                finetune_from=args.finetune_from,
+                freeze_layers=args.freeze_layers
             )
         
-        elif args.model_type == "obb":
-            YOLOTrainerV2.train_incremental(
-                registry=registry,
+        elif args.action == "train-obb":
+            YOLOTrainer.train_obb(
+                split_dir=args.split_dir,
                 output_dir=args.output_dir,
-                model_type="obb",
+                model_size=args.model_size,
                 epochs=args.epochs,
+                imgsz=args.imgsz,
                 batch=args.batch,
-                pretrained_weights=args.pretrained_weights,
-                freeze_layers=args.freeze_layers,
-                device=args.device
+                device=args.device,
+                yolo_version=args.yolo_version,
+                resume_from=args.resume_from,
+                finetune_from=args.finetune_from,
+                freeze_layers=args.freeze_layers
             )
         
-        elif args.model_type == "tracknet":
-            TrackNetTrainerV2.train(
-                registry=registry,
+        elif args.action == "train-tracknet":
+            TrackNetTrainer.train(
+                split_dir=args.split_dir,
                 output_dir=args.output_dir,
+                sequence_length=args.sequence_length,
+                img_size=args.tracknet_img_size,
                 epochs=args.epochs,
                 batch_size=args.batch,
-                pretrained_weights=args.pretrained_weights,
+                lr=args.lr,
+                device=args.device,
+                resume_from=args.resume_from,
+                finetune_from=args.finetune_from,
+                freeze_encoder=args.freeze_encoder
+            )
+        
+        elif args.action == "track":
+            tracker = ShuttleTracker(
+                yolo_weights=args.yolo_weights,
+                obb_weights=args.obb_weights,
+                tracknet_weights=args.tracknet_weights,
                 device=args.device
             )
-    
-    elif args.command == "track":
-        tracker = AdaptiveShuttleTracker()
-        
-        if args.adaptive:
-            tracker.track_video_adaptive(
+            
+            tracker.track_video(
                 video_path=args.video,
-                output_path=args.output
+                output_path=args.output_video,
+                mode=args.mode,
+                conf_threshold=args.conf
             )
-        else:
-            # Manual tracking (implement similar to original code)
-            pass
+    
+    except Exception as e:
+        print(f"\n❌ Error: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        exit(1)

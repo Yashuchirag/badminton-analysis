@@ -126,6 +126,7 @@ class YOLOTrainer:
         if not YOLO_AVAILABLE:
             raise RuntimeError("ultralytics not installed. Run: pip install ultralytics")
         
+        output_dir = os.path.abspath(output_dir)
         yaml_path = YOLOTrainer.create_dataset_yaml(split_dir, use_obb=False)
 
         # Fine-tuning mode: load your own model
@@ -236,6 +237,7 @@ class YOLOTrainer:
         if not YOLO_AVAILABLE:
             raise RuntimeError("ultralytics not installed. Run: pip install ultralytics")
         
+        output_dir = os.path.abspath(output_dir)
         yaml_path = YOLOTrainer.create_dataset_yaml(split_dir, use_obb=True)
 
         # Determine training mode
@@ -596,6 +598,10 @@ class TrackNetTrainer:
             
             print(f"  Starting fine-tuning from epoch 0")
         
+        output_dir = os.path.join(output_dir, "tracknet")
+        os.makedirs(output_dir, exist_ok=True)
+
+
         print(f"\n{'='*70}")
         print("Training TrackNet")
         print(f"  Mode: {training_mode}")
@@ -707,8 +713,6 @@ class ShuttleTracker:
         elif self.device == "cuda" and not torch.cuda.is_available():
             print("⚠ CUDA not available, falling back to CPU")
             self.device = "cpu"
-        
-        print(f"Using device: {self.device}")
         
         if yolo_weights and YOLO_AVAILABLE:
             self.yolo_model = YOLO(yolo_weights)
@@ -921,8 +925,8 @@ if __name__ == "__main__":
     parser.add_argument("--batch", type=int, default=8)
     parser.add_argument("--imgsz", type=int, default=640)
     parser.add_argument("--device", default="0")
-    parser.add_argument("--yolo-version", default="8", choices=["8", "11"],
-                       help="YOLO version to use (default: 8, more stable)")
+    parser.add_argument("--yolo-version", default="11", choices=["8", "11"],
+                       help="YOLO version to use (default:11, more stable)")
     
     # Fine-tuning args
     parser.add_argument("--resume-from", help="Resume interrupted training from checkpoint")
