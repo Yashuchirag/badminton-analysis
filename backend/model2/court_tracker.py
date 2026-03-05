@@ -109,6 +109,8 @@ class CourtTracker:
             minLineLength=self.min_line_length,
             maxLineGap=self.max_line_gap,
         )
+
+        print("Raw lines:", raw_lines)
         if raw_lines is None:
             return self._fallback()
 
@@ -543,63 +545,62 @@ def track_video_with_court(
 
         # --- Shuttle detection (reuse your existing logic) ---
         shuttle_pos = None
-        if mode == "yolo" and shuttle_tracker.yolo_model:
-            shuttle_pos = shuttle_tracker._detect_yolo(
-                frame, shuttle_tracker.yolo_model, conf_threshold)
-        elif mode == "obb" and shuttle_tracker.obb_model:
-            shuttle_pos = shuttle_tracker._detect_yolo(
-                frame, shuttle_tracker.obb_model, conf_threshold, is_obb=True)
-        elif mode == "tracknet" and shuttle_tracker.tracknet_model:
-            shuttle_pos = shuttle_tracker._detect_tracknet(frame)
-        elif mode == "hybrid":
-            yolo_pos = None
-            if shuttle_tracker.obb_model:
-                yolo_pos = shuttle_tracker._detect_yolo(
-                    frame, shuttle_tracker.obb_model, conf_threshold, is_obb=True)
-            elif shuttle_tracker.yolo_model:
-                yolo_pos = shuttle_tracker._detect_yolo(
-                    frame, shuttle_tracker.yolo_model, conf_threshold)
-            tracknet_pos = (shuttle_tracker._detect_tracknet(frame)
-                            if shuttle_tracker.tracknet_model else None)
-            if yolo_pos and tracknet_pos:
-                import numpy as np
-                dist = np.hypot(yolo_pos[0] - tracknet_pos[0],
-                                yolo_pos[1] - tracknet_pos[1])
-                shuttle_pos = tracknet_pos if dist < 50 else yolo_pos
-            else:
-                shuttle_pos = yolo_pos or tracknet_pos
+        # if mode == "yolo" and shuttle_tracker.yolo_model:
+        #     shuttle_pos = shuttle_tracker._detect_yolo(
+        #         frame, shuttle_tracker.yolo_model, conf_threshold)
+        # elif mode == "obb" and shuttle_tracker.obb_model:
+        #     shuttle_pos = shuttle_tracker._detect_yolo(
+        #         frame, shuttle_tracker.obb_model, conf_threshold, is_obb=True)
+        # elif mode == "tracknet" and shuttle_tracker.tracknet_model:
+        #     shuttle_pos = shuttle_tracker._detect_tracknet(frame)
+        # elif mode == "hybrid":
+        #     yolo_pos = None
+        #     if shuttle_tracker.obb_model:
+        #         yolo_pos = shuttle_tracker._detect_yolo(
+        #             frame, shuttle_tracker.obb_model, conf_threshold, is_obb=True)
+        #     elif shuttle_tracker.yolo_model:
+        #         yolo_pos = shuttle_tracker._detect_yolo(
+        #             frame, shuttle_tracker.yolo_model, conf_threshold)
+        #     tracknet_pos = (shuttle_tracker._detect_tracknet(frame)
+        #                     if shuttle_tracker.tracknet_model else None)
+        #     if yolo_pos and tracknet_pos:
+        #         import numpy as np
+        #         dist = np.hypot(yolo_pos[0] - tracknet_pos[0],
+        #                         yolo_pos[1] - tracknet_pos[1])
+        #         shuttle_pos = tracknet_pos if dist < 50 else yolo_pos
+        #     else:
+        #         shuttle_pos = yolo_pos or tracknet_pos
 
-        # --- Draw court overlay ---
-        if court:
-            court_tracker.draw(frame, court, shuttle_pixel=shuttle_pos)
+        # # --- Draw court overlay ---
+        # if court:
+        #     court_tracker.draw(frame, court, shuttle_pixel=shuttle_pos)
+        # # --- Draw shuttle ---
+        # if shuttle_pos:
+        #     x, y = int(shuttle_pos[0]), int(shuttle_pos[1])
+        #     trail.append((x, y))
+        #     cv2.circle(frame, (x, y), 12, (0, 255, 0), 2)
+        #     cv2.circle(frame, (x, y),  3, (0, 255, 0), -1)
 
-        # --- Draw shuttle ---
-        if shuttle_pos:
-            x, y = int(shuttle_pos[0]), int(shuttle_pos[1])
-            trail.append((x, y))
-            cv2.circle(frame, (x, y), 12, (0, 255, 0), 2)
-            cv2.circle(frame, (x, y),  3, (0, 255, 0), -1)
+        #     # Trail
+        #     for i in range(1, len(trail)):
+        #         alpha = i / len(trail)
+        #         cv2.line(frame, trail[i - 1], trail[i],
+        #                  (0, int(255 * alpha), 0), 2)
 
-            # Trail
-            for i in range(1, len(trail)):
-                alpha = i / len(trail)
-                cv2.line(frame, trail[i - 1], trail[i],
-                         (0, int(255 * alpha), 0), 2)
+        #     # Real-world position
+        #     if court:
+        #         cx, cy = court_tracker.pixel_to_court(court, shuttle_pos)
+        #         cv2.putText(frame,
+        #                     f"Court: ({cx:.2f}m, {cy:.2f}m)",
+        #                     (10, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
 
-            # Real-world position
-            if court:
-                cx, cy = court_tracker.pixel_to_court(court, shuttle_pos)
-                cv2.putText(frame,
-                            f"Court: ({cx:.2f}m, {cy:.2f}m)",
-                            (10, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
-
-        # HUD
-        cv2.putText(frame, f"Frame {frame_idx}  Mode: {mode.upper()}",
-                    (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 220, 255), 2)
-        if shuttle_pos:
-            cv2.putText(frame,
-                        f"Shuttle px: ({int(shuttle_pos[0])}, {int(shuttle_pos[1])})",
-                        (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 220, 255), 2)
+        # # HUD
+        # cv2.putText(frame, f"Frame {frame_idx}  Mode: {mode.upper()}",
+        #             (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 220, 255), 2)
+        # if shuttle_pos:
+        #     cv2.putText(frame,
+        #                 f"Shuttle px: ({int(shuttle_pos[0])}, {int(shuttle_pos[1])})",
+        #                 (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 220, 255), 2)
 
         out.write(frame)
         frame_idx += 1

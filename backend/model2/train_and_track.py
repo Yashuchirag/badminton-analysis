@@ -801,16 +801,8 @@ class ShuttleTracker:
                 trail.append((x, y))
                 
                 # Draw current position
-                # cv2.circle(frame, (x, y), 8, (0, 255, 0), -1)
                 cv2.circle(frame, (x, y), 12, (0, 255, 0), 2)
                 
-                # Draw trail
-                # if show_trail and len(trail) > 1:
-                #     for i in range(1, len(trail)):
-                #         alpha = i / len(trail)
-                #         color = (0, int(255 * alpha), 0)
-                #         cv2.line(frame, trail[i-1], trail[i], color, 2)
-            
             # Info overlay
             cv2.putText(frame, f"Frame: {frame_idx}  Mode: {mode.upper()}",
                        (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
