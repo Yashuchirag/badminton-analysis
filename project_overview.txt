@@ -1,0 +1,33 @@
+# 🏸 Badminton Video Scoring App (Game Tracker)
+## Project Overview & Summary
+
+### 🚀 Vision & Purpose
+An Expo + React Native mobile application that takes badminton match videos as input and produces automated scoring and analytics using computer vision and machine learning.
+It aims to bridge sports, software, and AI, focusing on offline/online video processing to detect rallies, shots, player actions, and scoring events in badminton matches.
+
+### 🧱 Architecture
+The project is divided into two decoupled components:
+1. **Frontend**: A mobile application built with Expo (SDK 54), React Native, Expo Router, and TypeScript. It handles video selection, playback, and displaying match scores, stats, and visual summaries to the user.
+2. **Backend / ML Service**: A Python-based backend service utilizing FastAPI to handle asynchronous video uploads and processing pipelines. It employs OpenCV for video frame processing, YOLOv8 (and YOLO-OBB) for player and shuttle detection, and TrackNet for high-speed shuttle tracking.
+
+### ✨ Key Features
+**Current Status:**
+- Mobile App scaffolding with Expo completed.
+- Video picker integration completed.
+- Backend experimentation and tracking pipeline with YOLO v8 (Pose, OBB) & TrackNet completed.
+- Asynchronous video processing API endpoint (/track-human-video-async) for automated tracking built using FastAPI.
+
+**Planned & In-Progress:**
+- Automatic point detection and rally-based score updates.
+- Player movement analysis, shot distribution, and match flow reconstruction.
+- Support for singles & doubles tracking.
+- Complete court mapping, temporal shot classification, and robust scoring logic.
+- Real-time scoring and coach training modes.
+
+### 📁 Project Structure
+- `frontend/myApp/`: Contains the Expo React Native application source code, handling UI layers and video interactions.
+- `backend/`: Contains the FastAPI application (`main.py`) which exposes backend services for model tracking. It also manages the ML tracking configurations, models (`yolov8n.pt`, pose models), and data preparation/fine-tuning scripts (`train_and_track.py`, `data_preparation.py`).
+
+### 👤 Author
+**Chirag Chandrashekar**
+AI / ML Engineer | Sports Analytics Enthusiast

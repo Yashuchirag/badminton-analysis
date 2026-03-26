@@ -24,7 +24,16 @@ except ImportError:
     TORCH_AVAILABLE = False
     print("⚠ PyTorch not installed. TrackNet training disabled.")
 
+def get_device():
+    """Auto-detect best available device."""
+    if TORCH_AVAILABLE:
+        if torch.cuda.is_available():  # Works for both NVIDIA and AMD ROCm
+            return "0"                 # GPU device 0
+        else:
+            return "cpu"
+    return "cpu"
 
+DEVICE = get_device()
 # ══════════════════════════════════════════════════════════════════════════
 # 1. YOLO Training (Standard + OBB)
 # ══════════════════════════════════════════════════════════════════════════
@@ -108,7 +117,7 @@ class YOLOTrainer:
         epochs: int = 10,
         imgsz: int = 640,
         batch: int = 8,
-        device: str = "0",
+        device: str = DEVICE,
         pretrained: bool = True,
         yolo_version: str = "8",
         resume_from: Optional[str] = None,      # Resume interrupted training
@@ -217,7 +226,7 @@ class YOLOTrainer:
         epochs: int = 10,
         imgsz: int = 640,
         batch: int = 8,
-        device: str = "0",
+        device: str = DEVICE,
         pretrained: bool = True,
         yolo_version: str = "8",
         resume_from: Optional[str] = None,
@@ -504,7 +513,7 @@ class TrackNetTrainer:
         epochs: int = 10,
         batch_size: int = 8,
         lr: float = 1e-4,
-        device: str = '0',
+        device: str = DEVICE,
         resume_from: Optional[str] = None,      # Resume interrupted training
         finetune_from: Optional[str] = None,    # Fine-tune from pre-trained weights
         freeze_encoder: bool = False 
@@ -694,7 +703,7 @@ class ShuttleTracker:
     """Unified inference for YOLO, TrackNet, and hybrid tracking."""
     
     def __init__(self, yolo_weights=None, obb_weights=None, tracknet_weights=None,
-                 device='0'):
+                 device=DEVICE):
         """
         Args:
             yolo_weights: Path to YOLO standard weights
@@ -916,7 +925,7 @@ if __name__ == "__main__":
     parser.add_argument("--epochs", type=int, default=10)
     parser.add_argument("--batch", type=int, default=8)
     parser.add_argument("--imgsz", type=int, default=640)
-    parser.add_argument("--device", default="0")
+    parser.add_argument("--device", default=DEVICE)
     parser.add_argument("--yolo-version", default="11", choices=["8", "11"],
                        help="YOLO version to use (default:11, more stable)")
     
