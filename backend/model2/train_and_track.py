@@ -24,6 +24,31 @@ except ImportError:
     TORCH_AVAILABLE = False
     print("⚠ PyTorch not installed. TrackNet training disabled.")
 
+
+CONFIG_FILE = os.path.join(os.path.dirname(__file__), "shuttle_config.json")
+
+def load_config() -> dict:
+    """Load config from shuttle_config.json if it exists."""
+    if os.path.exists(CONFIG_FILE):
+        with open(CONFIG_FILE) as f:
+            return json.load(f)
+    return {}
+
+def save_config(config: dict):
+    """Save config to shuttle_config.json."""
+    with open(CONFIG_FILE, "w") as f:
+        json.dump(config, f, indent=4)
+    print(f"✓ Config saved to {CONFIG_FILE}")
+
+def get_default(config: dict, *keys, fallback=None):
+    """Safely traverse nested config keys."""
+    val = config
+    for key in keys:
+        if not isinstance(val, dict) or key not in val:
+            return fallback
+        val = val[key]
+    return val
+
 def get_device():
     """Auto-detect best available device."""
     if TORCH_AVAILABLE:
@@ -34,6 +59,7 @@ def get_device():
     return "cpu"
 
 DEVICE = get_device()
+
 # ══════════════════════════════════════════════════════════════════════════
 # 1. YOLO Training (Standard + OBB)
 # ══════════════════════════════════════════════════════════════════════════
@@ -421,10 +447,8 @@ class TrackNetDataset(Dataset):
             
             # Gaussian heatmap (sigma = 5 pixels)
             sigma = 5
-            for i in range(max(0, y - 3*sigma), min(self.img_size, y + 3*sigma)):
-                for j in range(max(0, x - 3*sigma), min(self.img_size, x + 3*sigma)):
-                    dist_sq = (i - y)**2 + (j - x)**2
-                    heatmap[i, j] = np.exp(-dist_sq / (2 * sigma**2))
+            yy, xx = np.mgrid[0:self.img_size, 0:self.img_size]
+            heatmap = np.exp(-((xx - x)**2 + (yy - y)**2) / (2 * sigma**2))
         
         return torch.FloatTensor(images), torch.FloatTensor(heatmap)
 
@@ -914,20 +938,48 @@ class ShuttleTracker:
 if __name__ == "__main__":
     import argparse
     
-    parser = argparse.ArgumentParser(description="Train and track shuttle")
-    parser.add_argument("--action", choices=["train-yolo", "train-obb", "train-tracknet", "track"],
-                       required=True)
+    config = load_config()
     
+    parser = argparse.ArgumentParser(
+        description="Train and track shuttle",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter
+        )
+    parser.add_argument("--action", choices=["train-yolo", "train-obb", "train-tracknet", "track", "save-config"],
+                       required=True)
+
+    # Paths (fall back to config file)
+    parser.add_argument("--split-dir",
+                        default=get_default(config, "paths", "split_dir"))
+    parser.add_argument("--output-dir",
+                        default=get_default(config, "paths", "output_dir"))
+    parser.add_argument("--yolo-weights",
+                        default=get_default(config, "paths", "yolo_weights"))
+    parser.add_argument("--obb-weights",
+                        default=get_default(config, "paths", "obb_weights"))
+    parser.add_argument("--tracknet-weights",
+                        default=get_default(config, "paths", "tracknet_weights"))
+
     # Training args
-    parser.add_argument("--split-dir", help="Path to splits/ directory")
-    parser.add_argument("--output-dir", help="Where to save trained models")
-    parser.add_argument("--model-size", default="n", choices=["n", "s", "m", "l", "x"])
-    parser.add_argument("--epochs", type=int, default=10)
-    parser.add_argument("--batch", type=int, default=8)
-    parser.add_argument("--imgsz", type=int, default=640)
-    parser.add_argument("--device", default=DEVICE)
-    parser.add_argument("--yolo-version", default="11", choices=["8", "11"],
-                       help="YOLO version to use (default:11, more stable)")
+    parser.add_argument("--model-size",
+                        default=get_default(config, "training", "model_size", fallback="n"),
+                        choices=["n", "s", "m", "l", "x"])
+    parser.add_argument("--epochs",      type=int,
+                        default=get_default(config, "training", "epochs",    fallback=10))
+    parser.add_argument("--batch",       type=int,
+                        default=get_default(config, "training", "batch",     fallback=8))
+    parser.add_argument("--imgsz",       type=int,
+                        default=get_default(config, "training", "imgsz",     fallback=640))
+    parser.add_argument("--device",
+                        default=DEVICE)
+    parser.add_argument("--yolo-version",
+                        default=get_default(config, "training", "yolo_version", fallback="11"),
+                        choices=["8", "11"])
+    parser.add_argument("--lr",          type=float,
+                        default=get_default(config, "training", "lr",        fallback=1e-4))
+    parser.add_argument("--sequence-length", type=int,
+                        default=get_default(config, "training", "sequence_length", fallback=3))
+    parser.add_argument("--tracknet-img-size", type=int,
+                        default=get_default(config, "training", "tracknet_img_size", fallback=512))
     
     # Fine-tuning args
     parser.add_argument("--resume-from", help="Resume interrupted training from checkpoint")
@@ -937,24 +989,48 @@ if __name__ == "__main__":
     parser.add_argument("--freeze-encoder", action="store_true",
                        help="Freeze encoder layers for TrackNet fine-tuning")
     
-    # TrackNet specific
-    parser.add_argument("--sequence-length", type=int, default=3)
-    parser.add_argument("--tracknet-img-size", type=int, default=512)
-    parser.add_argument("--lr", type=float, default=1e-4, help="Learning rate for TrackNet")
-    
+
     # Inference args
     parser.add_argument("--video", help="Input video for tracking")
     parser.add_argument("--output-video", help="Output tracked video")
-    parser.add_argument("--yolo-weights", help="Path to YOLO weights")
-    parser.add_argument("--obb-weights", help="Path to OBB weights")
-    parser.add_argument("--tracknet-weights", help="Path to TrackNet weights")
-    parser.add_argument("--mode", default="hybrid", choices=["yolo", "obb", "tracknet", "hybrid"])
-    parser.add_argument("--conf", type=float, default=0.25)
+    parser.add_argument("--mode",
+                        default=get_default(config, "inference", "mode",     fallback="hybrid"),
+                        choices=["yolo", "obb", "tracknet", "hybrid"])
+    parser.add_argument("--conf",        type=float,
+                        default=get_default(config, "inference", "conf",     fallback=0.25))
     
     args = parser.parse_args()
     
     try:
-        if args.action == "train-yolo":
+        if args.action == "save-config":
+            new_config = {
+                "paths": {
+                    "split_dir":         args.split_dir,
+                    "output_dir":        args.output_dir,
+                    "yolo_weights":      args.yolo_weights,
+                    "obb_weights":       args.obb_weights,
+                    "tracknet_weights":  args.tracknet_weights,
+                },
+                "training": {
+                    "model_size":        args.model_size,
+                    "epochs":            args.epochs,
+                    "batch":             args.batch,
+                    "imgsz":             args.imgsz,
+                    "device":            args.device,
+                    "yolo_version":      args.yolo_version,
+                    "lr":                args.lr,
+                    "sequence_length":   args.sequence_length,
+                    "tracknet_img_size": args.tracknet_img_size,
+                },
+                "inference": {
+                    "mode":         args.mode,
+                    "conf":         args.conf,
+                    "trail_length": 30,
+                }
+            }
+            save_config(new_config)
+            exit(0)
+        elif args.action == "train-yolo":
             YOLOTrainer.train_standard(
                 split_dir=args.split_dir,
                 output_dir=args.output_dir,

@@ -1,0 +1,24 @@
+{
+    "paths": {
+        "split_dir": "./dataset/processed/v1",
+        "output_dir": "./models/shuttle",
+        "yolo_weights": "./models/shuttle/yolo_standard/weights/best.pt",
+        "obb_weights": "./models/shuttle/yolo_obb/weights/best.pt",
+        "tracknet_weights": "./models/shuttle/tracknet/tracknet_best.pth"
+    },
+    "training": {
+        "model_size": "n",
+        "epochs": 10,
+        "batch": 8,
+        "imgsz": 640,
+        "yolo_version": "11",
+        "lr": 0.0001,
+        "sequence_length": 3,
+        "tracknet_img_size": 512
+    },
+    "inference": {
+        "mode": "hybrid",
+        "conf": 0.25,
+        "trail_length": 30
+    }
+}

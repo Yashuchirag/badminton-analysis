@@ -61,6 +61,7 @@ yolo*.pt
 ubenv/
 runs/
 backend/model2/trained_models/
+backend/model2/models/
 
 
 
