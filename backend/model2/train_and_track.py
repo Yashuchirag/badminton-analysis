@@ -7,6 +7,8 @@ from pathlib import Path
 from collections import deque
 from typing import Optional
 
+from rally_tracker import RallyDetector
+
 try:
     from ultralytics import YOLO
     YOLO_AVAILABLE = True
@@ -60,9 +62,6 @@ def get_device():
 
 DEVICE = get_device()
 
-# ══════════════════════════════════════════════════════════════════════════
-# 1. YOLO Training (Standard + OBB)
-# ══════════════════════════════════════════════════════════════════════════
 
 class YOLOTrainer:
     """Train YOLOv8/v11 for shuttle detection (standard or OBB mode)."""
@@ -363,10 +362,6 @@ class YOLOTrainer:
         
         return model, metrics
 
-
-# ══════════════════════════════════════════════════════════════════════════
-# 2. TrackNet Training (Temporal Heatmap Tracking)
-# ══════════════════════════════════════════════════════════════════════════
 
 class TrackNetDataset(Dataset):
     """Dataset for TrackNet training (multi-frame input → heatmap output)."""
@@ -724,9 +719,6 @@ class TrackNetTrainer:
         return model
 
 
-# ══════════════════════════════════════════════════════════════════════════
-# 3. Inference on New Videos
-# ══════════════════════════════════════════════════════════════════════════
 
 class ShuttleTracker:
     """Unified inference for YOLO, TrackNet, and hybrid tracking."""
@@ -771,7 +763,8 @@ class ShuttleTracker:
     
     def track_video(self, video_path: str, output_path: str,
                     mode: str = "hybrid", conf_threshold: float = 0.25,
-                    show_trail: bool = True, trail_length: int = 30):
+                    show_trail: bool = True, trail_length: int = 30,
+                    save_analytics: bool = True):
         """Track shuttle in video and save annotated output.
         
         Args:
@@ -792,6 +785,7 @@ class ShuttleTracker:
         
         trail = deque(maxlen=trail_length)
         frame_idx = 0
+        rally_detector = RallyDetector(fps=fps)
         
         print(f"\nTracking video: {video_path}")
         print(f"  Mode: {mode}")
@@ -840,7 +834,14 @@ class ShuttleTracker:
                 
                 # Draw current position
                 cv2.circle(frame, (x, y), 12, (0, 255, 0), 2)
-                
+            
+            rally_detector.update(frame_idx, position)
+            current_rally_num = len(rally_detector.rallies) + (
+                1 if rally_detector.state == "IN_PLAY" else 0
+            )
+            cv2.putText(frame, f"Rally: {current_rally_num}  Shots: {len(rally_detector.current_positions)//4}",
+                   (10, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 200, 255), 2)
+            
             # Info overlay
             cv2.putText(frame, f"Frame: {frame_idx}  Mode: {mode.upper()}",
                        (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
@@ -859,6 +860,14 @@ class ShuttleTracker:
         
         print(f"✓ Tracking complete → {output_path}")
         print(f"  Frames processed: {frame_idx}")
+        if save_analytics:
+            summary = rally_detector.get_summary()
+            analytics_path = output_path.replace(".mp4", "_analytics.json")
+            with open(analytics_path, "w") as f:
+                json.dump(summary, f, indent=4)
+            print(f"✓ Analytics saved → {analytics_path}")
+
+        return rally_detector.get_summary()
     
     def _detect_yolo(self, frame, model, conf_threshold, is_obb=False):
         results = model(frame, conf=conf_threshold, verbose=False)
@@ -935,11 +944,6 @@ class ShuttleTracker:
             return (x, y)
         return None
 
-
-# ══════════════════════════════════════════════════════════════════════════
-# 4. Main Entry Point
-# ══════════════════════════════════════════════════════════════════════════
-
 if __name__ == "__main__":
     import argparse
     
@@ -1003,6 +1007,12 @@ if __name__ == "__main__":
                         choices=["yolo", "obb", "tracknet", "hybrid"])
     parser.add_argument("--conf",        type=float,
                         default=get_default(config, "inference", "conf",     fallback=0.25))
+    
+    # Rally tracking args
+    parser.add_argument("--gap-seconds", type=float, default=0.5,
+                        help="Seconds of no detection to end a rally")
+    parser.add_argument("--save-analytics", action="store_true",
+                        help="Save rally analytics JSON alongside output video")
     
     args = parser.parse_args()
     
