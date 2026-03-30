@@ -1,10 +1,10 @@
 {
     "paths": {
-        "split_dir": "./dataset/processed/v1",
+        "split_dir": "./dataset/processed/v2",
         "output_dir": "./models/shuttle",
-        "yolo_weights": "./models/shuttle/yolo_standard/weights/best.pt",
-        "obb_weights": "./models/shuttle/yolo_obb/weights/best.pt",
-        "tracknet_weights": "./models/shuttle/tracknet/tracknet_best.pth"
+        "yolo_weights": "./models/shuttle/yolo_finetune/weights/best.pt",
+        "obb_weights": "./models/shuttle/yolo_obb_finetune/weights/best.pt",
+        "tracknet_weights": "./models/shuttle/tracknet_finetune/tracknet_best.pth"
     },
     "training": {
         "model_size": "n",

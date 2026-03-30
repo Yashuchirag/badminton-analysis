@@ -164,7 +164,7 @@ class YOLOTrainer:
         output_dir = os.path.abspath(output_dir)
         yaml_path = YOLOTrainer.create_dataset_yaml(split_dir, use_obb=False)
 
-        # Fine-tuning mode: load your own model
+        # Restart training from your own model
         if resume_from:
             if not os.path.exists(resume_from):
                 raise FileNotFoundError(f"Resume checkpoint not found: {resume_from}")
@@ -215,6 +215,8 @@ class YOLOTrainer:
         if freeze_layers > 0:
             print(f"  Frozen layers: {freeze_layers}")
         print(f"{'='*70}")
+
+        run_name = "yolo_finetune" if finetune_from else "yolo_standard"
         
         # Train
         results = model.train(
@@ -224,7 +226,7 @@ class YOLOTrainer:
                 batch=batch,
                 device=device,
                 project=output_dir,
-                name="yolo_standard",
+                name=run_name,
                 exist_ok=True,
                 pretrained=use_pretrained,
                 resume=bool(resume_from),  # Only resume if resume_from is set
@@ -237,7 +239,7 @@ class YOLOTrainer:
         print(f"\n{'='*70}")
         print("Training Complete - Standard YOLO")
         print(f"{'='*70}")
-        print(f"  Best weights: {output_dir}/yolo_standard/weights/best.pt")
+        print(f"  Best weights: {output_dir}/{run_name}/weights/best.pt")
         print(f"  mAP50: {metrics.box.map50:.4f}")
         print(f"  mAP50-95: {metrics.box.map:.4f}")
         print(f"{'='*70}\n")
@@ -332,6 +334,8 @@ class YOLOTrainer:
         if freeze_layers > 0:
             print(f"  Frozen layers: {freeze_layers}")
         print(f"{'='*70}")
+
+        run_name = "yolo_obb_finetune" if finetune_from else "yolo_obb"
         
         results = model.train(
             data=yaml_path,
@@ -340,7 +344,7 @@ class YOLOTrainer:
             batch=batch,
             device=device,
             project=output_dir,
-            name="yolo_obb",
+            name=run_name,
             exist_ok=True,
             pretrained=use_pretrained,
             resume=bool(resume_from),
@@ -352,7 +356,7 @@ class YOLOTrainer:
         print(f"\n{'='*70}")
         print("Training Complete - YOLOv11-OBB")
         print(f"{'='*70}")
-        print(f"  Best weights: {output_dir}/yolo_obb/weights/best.pt")
+        print(f"  Best weights: {output_dir}/{run_name}/weights/best.pt")
         print(f"  mAP50: {metrics.box.map50:.4f}")
         print(f"  mAP50-95: {metrics.box.map:.4f}")
         print(f"{'='*70}\n")
@@ -631,7 +635,8 @@ class TrackNetTrainer:
             
             print(f"  Starting fine-tuning from epoch 0")
         
-        output_dir = os.path.join(output_dir, "tracknet")
+        folder_name = "tracknet_finetune" if finetune_from else "tracknet"
+        output_dir = os.path.join(output_dir, folder_name)
         os.makedirs(output_dir, exist_ok=True)
 
 
