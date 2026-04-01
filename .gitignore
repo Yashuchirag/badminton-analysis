@@ -11,8 +11,7 @@ yarn-error.log*
 # Build outputs
 dist/
 build/
-backend/model2/dataset/
-backend/model2/runs/train-track/
+
 
 ios/Pods/
 android/.gradle/
@@ -60,8 +59,12 @@ venv/
 yolo*.pt
 ubenv/
 runs/
+
+backend/model2/dataset/
+backend/model2/runs/
 backend/model2/trained_models/
 backend/model2/models/
+backend/model2/output_video
 
 
 

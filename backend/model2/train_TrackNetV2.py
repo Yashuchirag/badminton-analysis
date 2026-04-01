@@ -1,0 +1,1201 @@
+import os
+import yaml
+import json
+import csv
+import cv2
+import numpy as np
+from pathlib import Path
+from collections import deque
+from typing import Optional
+
+from TrackNetV2 import TrackNetV2
+
+try:
+    from ultralytics import YOLO
+    YOLO_AVAILABLE = True
+except ImportError:
+    YOLO_AVAILABLE = False
+    print("⚠ ultralytics not installed. YOLO training disabled.")
+
+try:
+    import torch
+    import torch.nn as nn
+    import torch.optim as optim
+    from torch.utils.data import Dataset, DataLoader
+    TORCH_AVAILABLE = True
+except ImportError:
+    TORCH_AVAILABLE = False
+    print("⚠ PyTorch not installed. TrackNetV2 training disabled.")
+
+
+CONFIG_FILE = os.path.join(os.path.dirname(__file__), "shuttle_config.json")
+
+def load_config() -> dict:
+    if os.path.exists(CONFIG_FILE):
+        with open(CONFIG_FILE) as f:
+            return json.load(f)
+    return {}
+
+def save_config(config: dict):
+    with open(CONFIG_FILE, "w") as f:
+        json.dump(config, f, indent=4)
+    print(f"✓ Config saved to {CONFIG_FILE}")
+
+def get_default(config: dict, *keys, fallback=None):
+    val = config
+    for key in keys:
+        if not isinstance(val, dict) or key not in val:
+            return fallback
+        val = val[key]
+    return val
+
+def get_device():
+    if TORCH_AVAILABLE:
+        if torch.cuda.is_available():
+            return "0"
+        return "cpu"
+    return "cpu"
+
+DEVICE = get_device()
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# 1. YOLO Training (Standard + OBB) — unchanged from your original
+# ══════════════════════════════════════════════════════════════════════════
+
+class YOLOTrainer:
+    """Train YOLOv8/v11 for shuttle detection (standard or OBB mode)."""
+
+    @staticmethod
+    def create_dataset_yaml(split_dir: str, use_obb: bool = False) -> str:
+        yaml_path = os.path.join(split_dir, "dataset.yaml")
+
+        if use_obb:
+            import shutil
+            for split in ['train', 'val', 'test']:
+                labels_dir     = os.path.join(split_dir, split, 'labels')
+                obb_labels_dir = os.path.join(split_dir, split, 'obb_labels')
+                if not os.path.exists(obb_labels_dir):
+                    print(f"⚠ Warning: {split}/obb_labels not found")
+                    continue
+                if os.path.exists(labels_dir):
+                    if os.path.islink(labels_dir):
+                        os.unlink(labels_dir)
+                    elif os.path.isdir(labels_dir):
+                        if os.path.samefile(labels_dir, obb_labels_dir):
+                            continue
+                        else:
+                            shutil.rmtree(labels_dir)
+                try:
+                    os.symlink(os.path.abspath(obb_labels_dir),
+                               labels_dir, target_is_directory=True)
+                    print(f"  ✓ Symlinked {split}/labels → obb_labels")
+                except (OSError, NotImplementedError):
+                    shutil.copytree(obb_labels_dir, labels_dir)
+                    print(f"  ✓ Copied {split}/obb_labels → labels")
+
+        config = {
+            "path":  os.path.abspath(split_dir),
+            "train": "train/images",
+            "val":   "val/images",
+            "test":  "test/images",
+            "nc":    1,
+            "names": ["shuttle"],
+        }
+        with open(yaml_path, "w") as f:
+            yaml.dump(config, f, default_flow_style=False)
+        print(f"✓ Created {yaml_path} | Mode: {'OBB' if use_obb else 'Standard'}")
+        return yaml_path
+
+    @staticmethod
+    def train_standard(
+        split_dir: str, output_dir: str,
+        model_size: str = "n", epochs: int = 100, imgsz: int = 640,
+        batch: int = 8, device: str = DEVICE, pretrained: bool = True,
+        yolo_version: str = "8", resume_from: Optional[str] = None,
+        finetune_from: Optional[str] = None, freeze_layers: int = 0, **kwargs
+    ):
+        if not YOLO_AVAILABLE:
+            raise RuntimeError("ultralytics not installed.")
+        output_dir = os.path.abspath(output_dir)
+        yaml_path  = YOLOTrainer.create_dataset_yaml(split_dir, use_obb=False)
+
+        if resume_from:
+            model          = YOLO(resume_from)
+            training_mode  = "RESUME"
+            use_pretrained = False
+        elif finetune_from:
+            model          = YOLO(finetune_from)
+            training_mode  = "FINE-TUNE"
+            use_pretrained = False
+            if freeze_layers > 0:
+                for i, (name, param) in enumerate(model.model.named_parameters()):
+                    if i < freeze_layers:
+                        param.requires_grad = False
+        elif pretrained:
+            try:
+                model = YOLO(f"yolo{yolo_version}{model_size}.pt")
+                training_mode = "PRETRAINED"
+            except Exception:
+                model = YOLO(f"yolov8{model_size}.pt")
+                yolo_version  = "8"
+                training_mode = "PRETRAINED"
+            use_pretrained = True
+        else:
+            model          = YOLO(f"yolo{yolo_version}{model_size}.yaml")
+            training_mode  = "FROM-SCRATCH"
+            use_pretrained = False
+
+        print(f"\n{'='*70}")
+        print(f"Training YOLOv{yolo_version}{model_size.upper()} Standard | Mode: {training_mode}")
+        print(f"{'='*70}")
+
+        run_name = "yolo_finetune" if finetune_from else "yolo_standard"
+        results  = model.train(
+            data=yaml_path, epochs=epochs, imgsz=imgsz, batch=batch,
+            device=device, project=output_dir, name=run_name,
+            exist_ok=True, pretrained=use_pretrained,
+            resume=bool(resume_from), patience=20, **kwargs
+        )
+        metrics = model.val()
+        print(f"\n✓ Standard YOLO complete | mAP50: {metrics.box.map50:.4f}")
+        return model, metrics
+
+    @staticmethod
+    def train_obb(
+        split_dir: str, output_dir: str,
+        model_size: str = "n", epochs: int = 100, imgsz: int = 640,
+        batch: int = 8, device: str = DEVICE, pretrained: bool = True,
+        yolo_version: str = "8", resume_from: Optional[str] = None,
+        finetune_from: Optional[str] = None, freeze_layers: int = 0, **kwargs
+    ):
+        if not YOLO_AVAILABLE:
+            raise RuntimeError("ultralytics not installed.")
+        output_dir = os.path.abspath(output_dir)
+        yaml_path  = YOLOTrainer.create_dataset_yaml(split_dir, use_obb=True)
+
+        if resume_from and finetune_from:
+            raise ValueError("Cannot use both resume_from and finetune_from.")
+
+        if resume_from:
+            model          = YOLO(resume_from)
+            training_mode  = "RESUME"
+            use_pretrained = False
+        elif finetune_from:
+            model          = YOLO(finetune_from)
+            training_mode  = "FINE-TUNE"
+            use_pretrained = False
+            if freeze_layers > 0:
+                for i, (name, param) in enumerate(model.model.named_parameters()):
+                    if i < freeze_layers:
+                        param.requires_grad = False
+        elif pretrained:
+            try:
+                model = YOLO(f"yolo{yolo_version}{model_size}-obb.pt")
+                training_mode = "PRETRAINED"
+            except Exception:
+                model = YOLO(f"yolov8{model_size}-obb.pt")
+                yolo_version  = "8"
+                training_mode = "PRETRAINED"
+            use_pretrained = True
+        else:
+            model          = YOLO(f"yolo{yolo_version}{model_size}-obb.yaml")
+            training_mode  = "FROM-SCRATCH"
+            use_pretrained = False
+
+        print(f"\n{'='*70}")
+        print(f"Training YOLOv{yolo_version}{model_size.upper()}-OBB | Mode: {training_mode}")
+        print(f"{'='*70}")
+
+        run_name = "yolo_obb_finetune" if finetune_from else "yolo_obb"
+        results  = model.train(
+            data=yaml_path, epochs=epochs, imgsz=imgsz, batch=batch,
+            device=device, project=output_dir, name=run_name,
+            exist_ok=True, pretrained=use_pretrained,
+            resume=bool(resume_from), patience=20, **kwargs
+        )
+        metrics = model.val()
+        print(f"\n✓ OBB YOLO complete | mAP50: {metrics.box.map50:.4f}")
+        return model, metrics
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# 2. TrackNetV2 Dataset Converter
+#    Reads: root/amateur/matchX/matchX.csv + matchX.mp4
+#           root/pro/matchX/matchX.csv     + matchX.mp4
+#           root/test/matchX/matchX.csv    + matchX.mp4
+# ══════════════════════════════════════════════════════════════════════════
+
+def convert_tracknetv2_dataset(
+    tracknetv2_dir: str,
+    output_split_dir: str,
+    val_ratio: float = 0.1,
+    frame_skip: int = 1,
+):
+    """
+    Converts TrackNetV2 dataset (MP4 + CSV) into annotations.json format.
+
+    Args:
+        tracknetv2_dir:   Root folder with amateur/, pro/, test/ subdirs
+        output_split_dir: Where to write train/val/test splits
+        val_ratio:        Fraction of matches to reserve for validation
+        frame_skip:       Extract every Nth frame (2 = half the frames)
+    """
+    root = Path(tracknetv2_dir)
+    out  = Path(output_split_dir)
+    splits = {"train": {}, "val": {}, "test": {}}
+
+    # Collect train/val matches from amateur + pro
+    trainval_matches = []
+    for category in ["amateur", "pro"]:
+        cat_dir = root / category
+        if not cat_dir.exists():
+            print(f"⚠ {category}/ not found — skipping")
+            continue
+        for match_dir in sorted(cat_dir.iterdir()):
+            if match_dir.is_dir():
+                trainval_matches.append((category, match_dir))
+
+    n_val         = max(1, int(len(trainval_matches) * val_ratio))
+    val_matches   = trainval_matches[-n_val:]
+    train_matches = trainval_matches[:-n_val]
+
+    print(f"Dataset split: {len(train_matches)} train | {len(val_matches)} val matches")
+
+    for split_name, match_list in [("train", train_matches), ("val", val_matches)]:
+        for category, match_dir in match_list:
+            _process_match(match_dir, category, split_name, out, splits, frame_skip)
+
+    # Test folder
+    test_dir = root / "test"
+    if test_dir.exists():
+        for match_dir in sorted(test_dir.iterdir()):
+            if match_dir.is_dir():
+                _process_match(match_dir, "test", "test", out, splits, frame_skip)
+
+    for split_name, annotations in splits.items():
+        ann_path = out / split_name / "annotations.json"
+        ann_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(ann_path, "w") as f:
+            json.dump(annotations, f, indent=2)
+        print(f"✓ {split_name}: {len(annotations)} frames → {ann_path}")
+
+    print("\n✓ Conversion complete!")
+    return out
+
+
+def _process_match(match_dir, category, split_name, out, splits, frame_skip):
+    """Extract frames from one match MP4 and read its CSV annotations."""
+    csv_files = list(match_dir.glob("*.csv"))
+    mp4_files = list(match_dir.glob("*.mp4"))
+
+    if not csv_files or not mp4_files:
+        print(f"  ⚠ Skipping {match_dir.name} — missing CSV or MP4")
+        return
+
+    csv_path   = csv_files[0]
+    mp4_path   = mp4_files[0]
+    match_name = f"{category}_{match_dir.name}"
+    print(f"  Processing {match_name} ...", end=" ", flush=True)
+
+    # Parse CSV: Frame, Visibility, X, Y
+    frame_anns = {}
+    with open(csv_path, "r") as f:
+        reader = csv.reader(f)
+        next(reader, None)  # skip header
+        for row in reader:
+            if len(row) < 4:
+                continue
+            try:
+                frame_num  = int(row[0])
+                visibility = int(row[1])
+                x = float(row[2]) if visibility == 1 else None
+                y = float(row[3]) if visibility == 1 else None
+                frame_anns[frame_num] = {
+                    "visibility": "visible" if visibility == 1 else "not_visible",
+                    "x": x, "y": y,
+                }
+            except (ValueError, IndexError):
+                continue
+
+    # Extract frames from MP4
+    out_img_dir = out / split_name / "images"
+    out_img_dir.mkdir(parents=True, exist_ok=True)
+
+    cap         = cv2.VideoCapture(str(mp4_path))
+    frame_idx   = 0
+    saved_count = 0
+
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            break
+
+        if frame_idx % frame_skip == 0:
+            unique_name = f"{match_name}_frame{frame_idx:05d}.jpg"
+            out_path    = out_img_dir / unique_name
+
+            if not out_path.exists():
+                cv2.imwrite(str(out_path), frame)
+
+            ann = frame_anns.get(frame_idx, {
+                "visibility": "not_visible", "x": None, "y": None,
+            })
+            splits[split_name][unique_name] = ann
+            saved_count += 1
+
+        frame_idx += 1
+
+    cap.release()
+    print(f"{saved_count} frames")
+
+
+def merge_with_existing_data(
+    existing_split_dir: str,
+    tracknetv2_split_dir: str,
+    merged_output_dir: str,
+):
+    """Merge your manually annotated data with converted TrackNetV2 data."""
+    import shutil
+
+    for split in ["train", "val", "test"]:
+        merged_ann  = {}
+        out_img_dir = Path(merged_output_dir) / split / "images"
+        out_img_dir.mkdir(parents=True, exist_ok=True)
+
+        for source_dir in [existing_split_dir, tracknetv2_split_dir]:
+            ann_path = Path(source_dir) / split / "annotations.json"
+            img_dir  = Path(source_dir) / split / "images"
+            if not ann_path.exists():
+                continue
+            with open(ann_path) as f:
+                anns = json.load(f)
+            for fname, ann in anns.items():
+                src = img_dir / fname
+                dst = out_img_dir / fname
+                if src.exists() and not dst.exists():
+                    shutil.copy2(src, dst)
+                merged_ann[fname] = ann
+
+        out_ann = Path(merged_output_dir) / split / "annotations.json"
+        with open(out_ann, "w") as f:
+            json.dump(merged_ann, f, indent=2)
+        print(f"✓ {split}: {len(merged_ann)} frames merged")
+
+
+
+class TrackNetDataset(Dataset):
+    """Dataset for TrackNetV2. Compatible with both your format and TrackNetV2 format."""
+
+    def __init__(self, split_dir: str, split: str = "train",
+                 sequence_length: int = 3, img_size: int = 512):
+        self.img_dir = Path(split_dir) / split / "images"
+        self.ann_path = Path(split_dir) / split / "annotations.json"
+        self.sequence_length = sequence_length
+        self.img_size = img_size
+
+        if not self.ann_path.exists():
+            raise FileNotFoundError(f"annotations.json not found: {self.ann_path}")
+
+        with open(self.ann_path) as f:
+            self.annotations = json.load(f)
+
+        self.frames = sorted(self.annotations.keys())
+        self.valid_indices = [
+            i for i in range(len(self.frames) - sequence_length + 1)
+            if self._are_consecutive(self.frames[i:i + sequence_length])
+        ]
+
+        print(f"TrackNet {split}: {len(self.valid_indices)} sequences "
+              f"(from {len(self.frames)} frames)")
+
+    def _get_prefix_and_num(self, fname: str):
+        import re
+        m = re.match(r"^(.+_frame)(\d+)\.jpg$", fname)
+        if m:
+            return m.group(1), int(m.group(2))
+        m2 = re.search(r"(\d+)", fname)
+        return "default_", int(m2.group(1)) if m2 else 0
+
+    def _are_consecutive(self, frame_list: list) -> bool:
+        prefixes, numbers = [], []
+        for fname in frame_list:
+            p, n = self._get_prefix_and_num(fname)
+            prefixes.append(p)
+            numbers.append(n)
+        if len(set(prefixes)) > 1:
+            return False
+        return all(numbers[i + 1] == numbers[i] + 1 for i in range(len(numbers) - 1))
+
+    def __len__(self):
+        return len(self.valid_indices)
+
+    def __getitem__(self, idx):
+        start      = self.valid_indices[idx]
+        seq_frames = self.frames[start:start + self.sequence_length]
+
+        images = []
+        for fname in seq_frames:
+            img = cv2.imread(str(self.img_dir / fname))
+            if img is None:
+                img = np.zeros((self.img_size, self.img_size, 3), dtype=np.uint8)
+            img = cv2.resize(img, (self.img_size, self.img_size))
+            img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+            images.append(img)
+
+        images = np.array(images).transpose(0, 3, 1, 2).astype(np.float32) / 255.0
+
+        last_ann = self.annotations[seq_frames[-1]]
+        heatmap  = np.zeros((self.img_size, self.img_size), dtype=np.float32)
+
+        if last_ann.get("visibility") == "visible" and last_ann.get("x") is not None:
+            orig = cv2.imread(str(self.img_dir / seq_frames[-1]))
+            if orig is not None:
+                h_orig, w_orig = orig.shape[:2]
+                x = max(0, min(int(float(last_ann["x"]) * self.img_size / w_orig), self.img_size - 1))
+                y = max(0, min(int(float(last_ann["y"]) * self.img_size / h_orig), self.img_size - 1))
+                sigma  = 5
+                yy, xx = np.mgrid[0:self.img_size, 0:self.img_size]
+                heatmap = np.exp(-((xx - x) ** 2 + (yy - y) ** 2) / (2 * sigma ** 2)).astype(np.float32)
+
+        return torch.FloatTensor(images), torch.FloatTensor(heatmap)
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# 5. TrackNetV2 Trainer
+# ══════════════════════════════════════════════════════════════════════════
+
+class TrackNetV2Trainer:
+    """
+    Trainer for TrackNetV2.
+    Key improvements over original:
+      - Early stopping   — no more guessing epoch counts
+      - LR scheduler     — halves LR on plateau automatically
+      - Accuracy metric  — tracks detection accuracy (within 5px) alongside loss
+      - Flexible weight loading — handles old TrackNet → new TrackNetV2 remapping
+    """
+
+    @staticmethod
+    def train(
+        split_dir: str,
+        output_dir: str,
+        sequence_length: int = 3,
+        img_size: int = 512,
+        epochs: int = 100,
+        batch_size: int = 8,
+        lr: float = 1e-4,
+        device: str = DEVICE,
+        patience: int = 15,
+        lr_patience: int = 5,
+        resume_from: Optional[str] = None,
+        finetune_from: Optional[str] = None,
+        freeze_encoder: bool = False,
+        log_every: int = 20,
+    ):
+        if not TORCH_AVAILABLE:
+            raise RuntimeError("PyTorch not installed.")
+
+        if device.isdigit():
+            device = f"cuda:{device}"
+        elif device == "cuda" and not torch.cuda.is_available():
+            print("⚠ CUDA not available, using CPU")
+            device = "cpu"
+
+        if resume_from and finetune_from:
+            raise ValueError("Cannot use both resume_from and finetune_from.")
+
+        train_ds = TrackNetDataset(split_dir, "train", sequence_length, img_size)
+        val_ds = TrackNetDataset(split_dir, "val",   sequence_length, img_size)
+        use_pin = device != "cpu"
+
+        train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True,
+                                  num_workers=4, pin_memory=use_pin)
+        val_loader = DataLoader(val_ds,   batch_size=batch_size, shuffle=False,
+                                  num_workers=4, pin_memory=use_pin)
+
+        model = TrackNetV2(sequence_length).to(device)
+        optimizer = optim.Adam(model.parameters(), lr=lr)
+        criterion = nn.BCELoss()
+        scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+            optimizer, mode="min", factor=0.5, patience=lr_patience, verbose=True
+        )
+
+        start_epoch = 0
+        best_val_loss = float("inf")
+        epochs_no_improve = 0
+        training_mode = "FROM SCRATCH"
+
+        if resume_from:
+            ckpt = torch.load(resume_from, map_location=device)
+            model.load_state_dict(ckpt["model_state_dict"])
+            optimizer.load_state_dict(ckpt["optimizer_state_dict"])
+            start_epoch = ckpt.get("epoch", 0) + 1
+            best_val_loss = ckpt.get("val_loss", float("inf"))
+            training_mode = "RESUME"
+            print(f"Resuming from epoch {start_epoch}")
+
+        elif finetune_from:
+            TrackNetV2Trainer._load_weights_flexible(model, finetune_from, device)
+            training_mode = "FINE-TUNE"
+            if freeze_encoder:
+                for name, param in model.named_parameters():
+                    if any(name.startswith(l) for l in ["enc1", "enc2", "enc3", "bottleneck"]):
+                        param.requires_grad = False
+                optimizer = optim.Adam(
+                    filter(lambda p: p.requires_grad, model.parameters()), lr=lr
+                )
+                print("Encoder frozen — decoder only")
+
+        folder   = "tracknetv2_finetune" if finetune_from else "tracknetv2"
+        save_dir = os.path.join(output_dir, folder)
+        os.makedirs(save_dir, exist_ok=True)
+
+        print(f"\n{'='*70}")
+        print("Training TrackNetV2")
+        print(f"  Mode            : {training_mode}")
+        print(f"  Device          : {device}")
+        print(f"  Train sequences : {len(train_ds)}")
+        print(f"  Val sequences   : {len(val_ds)}")
+        print(f"  Max epochs      : {epochs}  (early stop: {patience})")
+        print(f"  LR              : {lr}  (scheduler patience: {lr_patience})")
+        print(f"{'='*70}\n")
+
+        for epoch in range(start_epoch, start_epoch + epochs):
+            # ── Train ─────────────────────────────────────────────────
+            model.train()
+            train_loss = 0.0
+
+            for batch_idx, (images, heatmaps) in enumerate(train_loader):
+                images   = images.to(device)
+                heatmaps = heatmaps.to(device)
+                optimizer.zero_grad()
+                loss = criterion(model(images), heatmaps)
+                loss.backward()
+                optimizer.step()
+                train_loss += loss.item()
+
+                if (batch_idx + 1) % log_every == 0:
+                    print(f"  Epoch {epoch+1} | Batch {batch_idx+1}/{len(train_loader)} "
+                          f"| Loss: {train_loss / (batch_idx+1):.6f}")
+
+            train_loss /= len(train_loader)
+
+            # ── Validate ──────────────────────────────────────────────
+            model.eval()
+            val_loss    = 0.0
+            val_correct = 0
+            val_total   = 0
+
+            with torch.no_grad():
+                for images, heatmaps in val_loader:
+                    images   = images.to(device)
+                    heatmaps = heatmaps.to(device)
+                    outputs  = model(images)
+                    val_loss += criterion(outputs, heatmaps).item()
+
+                    for pred, gt in zip(outputs.cpu().numpy(), heatmaps.cpu().numpy()):
+                        if gt.max() > 0.5:
+                            py, px = np.unravel_index(pred.argmax(), pred.shape)
+                            gy, gx = np.unravel_index(gt.argmax(),   gt.shape)
+                            dist   = np.sqrt((px - gx) ** 2 + (py - gy) ** 2)
+                            val_correct += 1 if dist <= 5 else 0
+                            val_total   += 1
+
+            val_loss /= len(val_loader)
+            accuracy  = (val_correct / val_total * 100) if val_total > 0 else 0.0
+            scheduler.step(val_loss)
+            current_lr = optimizer.param_groups[0]["lr"]
+
+            print(f"Epoch {epoch+1}/{start_epoch+epochs} | "
+                  f"Train: {train_loss:.6f} | Val: {val_loss:.6f} | "
+                  f"Acc: {accuracy:.1f}% | LR: {current_lr:.2e}")
+
+            # ── Checkpoint ────────────────────────────────────────────
+            torch.save({
+                "epoch": epoch,
+                "model_state_dict":model.state_dict(),
+                "optimizer_state_dict": optimizer.state_dict(),
+                "train_loss": train_loss,
+                "val_loss":val_loss,
+                "accuracy":accuracy,
+            }, os.path.join(save_dir, f"tracknetv2_epoch_{epoch+1}.pth"))
+
+            if val_loss < best_val_loss:
+                best_val_loss = val_loss
+                epochs_no_improve = 0
+                torch.save({
+                    "epoch": epoch,
+                    "model_state_dict":model.state_dict(),
+                    "optimizer_state_dict": optimizer.state_dict(),
+                    "train_loss": train_loss,
+                    "val_loss":val_loss,
+                    "accuracy":accuracy,
+                }, os.path.join(save_dir, "tracknetv2_best.pth"))
+                print(f"  → Best saved (val: {val_loss:.6f}, acc: {accuracy:.1f}%)")
+            else:
+                epochs_no_improve += 1
+                if epochs_no_improve >= patience:
+                    print(f"\n⚡ Early stopping at epoch {epoch+1}")
+                    break
+
+        print(f"\n✓ Training complete | Best val loss: {best_val_loss:.6f}")
+        return model
+
+    @staticmethod
+    def _load_weights_flexible(model: nn.Module, weights_path: str, device: str):
+        """
+        Load weights with automatic remapping from old TrackNet → TrackNetV2.
+        Falls back to partial loading if shapes don't match.
+        """
+        ckpt      = torch.load(weights_path, map_location=device)
+        old_state = ckpt.get("model_state_dict", ckpt)
+        new_state = model.state_dict()
+
+        # Remap old TrackNet layer names to new TrackNetV2 names
+        remap = {
+            "conv1.0.weight": "enc1.0.weight", "conv1.0.bias": "enc1.0.bias",
+            "conv1.2.weight": "enc1.3.weight", "conv1.2.bias": "enc1.3.bias",
+            "conv2.0.weight": "enc2.0.weight", "conv2.0.bias": "enc2.0.bias",
+            "conv2.2.weight": "enc2.3.weight", "conv2.2.bias": "enc2.3.bias",
+            "conv3.0.weight": "enc3.0.weight", "conv3.0.bias": "enc3.0.bias",
+            "conv3.2.weight": "enc3.3.weight", "conv3.2.bias": "enc3.3.bias",
+        }
+        remapped = {remap.get(k, k): v for k, v in old_state.items()}
+        transferred = []
+
+        for name, param in new_state.items():
+            if name in remapped and remapped[name].shape == param.shape:
+                new_state[name] = remapped[name]
+                transferred.append(name)
+
+        model.load_state_dict(new_state)
+        skipped = len(new_state) - len(transferred)
+        print(f"  ✓ Loaded {len(transferred)} layers | "
+              f"⚠ {skipped} layers initialised from scratch")
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# 6. Shuttle Tracker  — OBB + TrackNetV2 hybrid
+# ══════════════════════════════════════════════════════════════════════════
+
+class ShuttleTracker:
+    """
+    Hybrid shuttle tracker: YOLO-OBB (appearance) + TrackNetV2 (temporal).
+
+    Detection modes:
+      yolo     — YOLO standard bounding boxes only
+      obb      — YOLO oriented bounding boxes only (best for motion blur)
+      tracknet — TrackNetV2 heatmap only
+      hybrid   — OBB + TrackNetV2 fused (recommended)
+    """
+
+    def __init__(self, yolo_weights=None, obb_weights=None,
+                 tracknet_weights=None, device=DEVICE):
+        self.device = device
+
+        if self.device.isdigit():
+            self.device = f"cuda:{self.device}"
+        elif self.device == "cuda" and not torch.cuda.is_available():
+            print("⚠ CUDA not available, using CPU")
+            self.device = "cpu"
+
+        self.yolo_model = None
+        self.obb_model = None
+        self.tracknet_model = None
+
+        if yolo_weights and YOLO_AVAILABLE:
+            self.yolo_model = YOLO(yolo_weights)
+            print(f"✓ Loaded YOLO: {yolo_weights}")
+
+        if obb_weights and YOLO_AVAILABLE:
+            self.obb_model = YOLO(obb_weights)
+            print(f"✓ Loaded YOLO-OBB: {obb_weights}")
+
+        if tracknet_weights and TORCH_AVAILABLE:
+            ckpt = torch.load(tracknet_weights, map_location=self.device)
+            self.tracknet_model = TrackNetV2(sequence_length=3).to(self.device)
+            self.tracknet_model.load_state_dict(ckpt["model_state_dict"])
+            self.tracknet_model.eval()
+            print(f"✓ Loaded TrackNetV2: {tracknet_weights}")
+
+        self.frame_buffer = deque(maxlen=3)
+
+    def track_video(
+        self,
+        video_path: str,
+        output_path: str,
+        mode: str = "hybrid",
+        conf_threshold: float = 0.25,
+        show_trail: bool = True,
+        trail_length: int = 30,
+        save_analytics: bool = True,
+    ):
+        """
+        Track shuttle in video and save annotated output.
+
+        Args:
+            video_path:      Input video path
+            output_path:     Output annotated video path
+            mode:            'yolo' | 'obb' | 'tracknet' | 'hybrid'
+            conf_threshold:  YOLO confidence threshold
+            show_trail:      Draw trajectory trail
+            trail_length:    How many past positions to show in trail
+            save_analytics:  Save rally analytics JSON alongside output video
+        """
+        cap    = cv2.VideoCapture(video_path)
+        fps    = int(cap.get(cv2.CAP_PROP_FPS))
+        width  = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+
+        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+        out    = cv2.VideoWriter(output_path, fourcc, fps, (width, height))
+
+        trail          = deque(maxlen=trail_length)
+        rally_detector = RallyDetector(fps=fps)
+        frame_idx      = 0
+
+        print(f"\nTracking: {video_path}")
+        print(f"  Mode: {mode} | FPS: {fps} | Resolution: {width}x{height}")
+
+        while True:
+            ret, frame = cap.read()
+            if not ret:
+                break
+
+            # ── Detect position ───────────────────────────────────────
+            position = None
+
+            if mode == "yolo" and self.yolo_model:
+                position = self._detect_yolo(frame, self.yolo_model, conf_threshold)
+
+            elif mode == "obb" and self.obb_model:
+                position = self._detect_yolo(frame, self.obb_model,
+                                             conf_threshold, is_obb=True)
+
+            elif mode == "tracknet" and self.tracknet_model:
+                position = self._detect_tracknet(frame)
+
+            elif mode == "hybrid":
+                # Step 1: OBB detection (appearance-based, single frame)
+                obb_pos = None
+                if self.obb_model:
+                    obb_pos = self._detect_yolo(frame, self.obb_model,
+                                                conf_threshold, is_obb=True)
+                elif self.yolo_model:
+                    obb_pos = self._detect_yolo(frame, self.yolo_model, conf_threshold)
+
+                # Step 2: TrackNetV2 prediction (temporal, 3-frame context)
+                tn_pos = self._detect_tracknet(frame) if self.tracknet_model else None
+
+                # Step 3: Fusion
+                #   Both agree (within 50px) → trust TrackNetV2 (more precise)
+                #   Only one available        → use whichever exists
+                #   Both disagree             → trust OBB (more robust to new positions)
+                if obb_pos and tn_pos:
+                    dist = np.sqrt((obb_pos[0] - tn_pos[0]) ** 2 +
+                                   (obb_pos[1] - tn_pos[1]) ** 2)
+                    position = tn_pos if dist < 50 else obb_pos
+                else:
+                    position = obb_pos or tn_pos
+
+            # ── Rally detection ───────────────────────────────────────
+            rally_detector.update(frame_idx, position)
+
+            # ── Draw trail ────────────────────────────────────────────
+            if show_trail and position:
+                x, y = int(position[0]), int(position[1])
+                trail.append((x, y))
+
+                trail_list = list(trail)
+                for i in range(1, len(trail_list)):
+                    if trail_list[i - 1] and trail_list[i]:
+                        color     = (0, 255, 0) if rally_detector.state == "IN_PLAY" \
+                                    else (128, 128, 128)
+                        thickness = max(1, int(3 * i / len(trail_list)))
+                        cv2.line(frame, trail_list[i - 1], trail_list[i],
+                                 color, thickness)
+
+                # Current shuttle position
+                cv2.circle(frame, (x, y), 8,  (0, 255, 255), -1)  # filled yellow
+                cv2.circle(frame, (x, y), 13, (0, 200, 0),   2)   # green ring
+
+            elif position:
+                trail.append((int(position[0]), int(position[1])))
+
+            # ── Shot markers ──────────────────────────────────────────
+            for marker in getattr(rally_detector, "last_shot_markers", []):
+                mx, my = int(marker[1]), int(marker[2])
+                cv2.circle(frame, (mx, my), 10, (0, 0, 255), 2)
+                cv2.putText(frame, "HIT", (mx + 12, my),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 0, 255), 1)
+
+            # ── HUD overlay ───────────────────────────────────────────
+            rally_num = len(rally_detector.rallies) + \
+                        (1 if rally_detector.state == "IN_PLAY" else 0)
+
+            hud = [
+                f"Frame: {frame_idx}  Mode: {mode.upper()}",
+                f"State: {rally_detector.state}",
+                f"Rally: {rally_num}",
+                f"No-detect: {rally_detector.no_detect_count}/{rally_detector.gap_threshold}",
+                f"Completed rallies: {len(rally_detector.rallies)}",
+            ]
+            if position:
+                hud.append(f"Pos: ({int(position[0])}, {int(position[1])})")
+
+            for i, line in enumerate(hud):
+                cv2.putText(frame, line, (10, 30 + i * 26),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2)
+
+            out.write(frame)
+            frame_idx += 1
+
+            if frame_idx % 100 == 0:
+                print(f"  Processed {frame_idx} frames...")
+
+        cap.release()
+        out.release()
+
+        # ── Save analytics JSON ───────────────────────────────────────
+        summary = rally_detector.get_summary()
+        if save_analytics and summary:
+            analytics_path = output_path.replace(".mp4", "_analytics.json")
+
+            class NumpyEncoder(json.JSONEncoder):
+                def default(self, obj):
+                    if isinstance(obj, np.floating): return float(obj)
+                    if isinstance(obj, np.integer):  return int(obj)
+                    if isinstance(obj, np.ndarray):  return obj.tolist()
+                    return super().default(obj)
+
+            with open(analytics_path, "w") as f:
+                json.dump(summary, f, indent=4, cls=NumpyEncoder)
+            print(f"✓ Analytics → {analytics_path}")
+
+        print(f"✓ Tracking complete → {output_path}")
+        print(f"  Frames: {frame_idx} | Rallies: {len(rally_detector.rallies)}")
+        return summary
+
+    def _detect_yolo(self, frame, model, conf_threshold, is_obb=False):
+        results = model(frame, conf=conf_threshold, verbose=False)
+        r       = results[0]
+
+        if is_obb:
+            if not hasattr(r, "obb") or r.obb is None or r.obb.conf is None:
+                return None
+            confs = r.obb.conf.cpu().numpy()
+            if len(confs) == 0:
+                return None
+            corners  = r.obb.xyxyxyxy.cpu().numpy()[np.argmax(confs)]
+            return (float(corners[:, 0].mean()), float(corners[:, 1].mean()))
+        else:
+            if r.boxes is None or r.boxes.conf is None:
+                return None
+            confs = r.boxes.conf.cpu().numpy()
+            if len(confs) == 0:
+                return None
+            x1, y1, x2, y2 = r.boxes.xyxy.cpu().numpy()[np.argmax(confs)]
+            return (float((x1 + x2) / 2), float((y1 + y2) / 2))
+
+    def _detect_tracknet(self, frame, img_size: int = 512, conf: float = 0.5):
+        """Run TrackNetV2 on the current frame using 3-frame buffer."""
+        if self.tracknet_model is None:
+            return None
+
+        self.frame_buffer.append(frame.copy())
+        if len(self.frame_buffer) < 3:
+            return None
+
+        # Prepare 3-frame sequence input
+        images = []
+        for f in self.frame_buffer:
+            img = cv2.resize(f, (img_size, img_size))
+            img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+            images.append(img)
+
+        x = np.array(images).transpose(0, 3, 1, 2).astype(np.float32) / 255.0
+        x = torch.FloatTensor(x).unsqueeze(0).to(self.device)  # (1, 3, 3, H, W)
+
+        with torch.no_grad():
+            heatmap = self.tracknet_model(x).cpu().numpy()[0]  # (H, W)
+
+        # Find peak in heatmap
+        y_max, x_max = np.unravel_index(heatmap.argmax(), heatmap.shape)
+
+        # Only return position if heatmap peak is confident enough
+        if heatmap[y_max, x_max] < conf:
+            return None
+
+        # Scale back to original frame coordinates
+        h, w = frame.shape[:2]
+        return (float(x_max * w / img_size), float(y_max * h / img_size))
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# 7. Rally Detector
+# ══════════════════════════════════════════════════════════════════════════
+
+class RallyDetector:
+    """Detects rallies and counts shots from shuttle position data."""
+
+    def __init__(self, fps: int, gap_seconds: float = 0.5,
+                 min_rally_frames: int = 15):
+        self.fps              = fps
+        self.gap_threshold    = int(gap_seconds * fps)
+        self.min_rally_frames = min_rally_frames
+        self.state            = "IDLE"
+        self.rallies          = []
+        self.current_positions = []
+        self.current_start_frame = None
+        self.no_detect_count  = 0
+        self.last_shot_markers = []
+
+    def update(self, frame_idx: int, position):
+        if position is not None:
+            # Fill gap with interpolated positions to avoid false rally splits
+            if self.state == "IN_PLAY" and self.no_detect_count > 0 \
+                    and self.current_positions:
+                last = self.current_positions[-1]
+                for gap_i in range(1, self.no_detect_count + 1):
+                    frac    = gap_i / (self.no_detect_count + 1)
+                    gap_x   = last[1] + frac * (float(position[0]) - last[1])
+                    gap_y   = last[2] + frac * (float(position[1]) - last[2])
+                    self.current_positions.append((last[0] + gap_i, gap_x, gap_y))
+
+            self.no_detect_count = 0
+
+            if self.state == "IDLE":
+                self.state = "IN_PLAY"
+                self.current_start_frame = frame_idx
+                self.current_positions   = []
+
+            self.current_positions.append((
+                int(frame_idx),
+                float(position[0]),
+                float(position[1]),
+            ))
+
+        else:
+            self.no_detect_count += 1
+            if self.state == "IN_PLAY" and self.no_detect_count >= self.gap_threshold:
+                self.state = "IDLE"
+                self._finalize_rally(frame_idx)
+
+    def _finalize_rally(self, end_frame: int):
+        duration = end_frame - self.current_start_frame
+        if duration < self.min_rally_frames:
+            self.current_positions = []
+            return
+
+        shot_count = self._count_shots(self.current_positions)
+        rally = {
+            "rally_id":         len(self.rallies) + 1,
+            "start_frame":      self.current_start_frame,
+            "end_frame":        end_frame,
+            "duration_seconds": round(duration / self.fps, 2),
+            "shot_count":       shot_count,
+            "positions":        self.current_positions,
+        }
+        self.rallies.append(rally)
+        print(f"  ✓ Rally {rally['rally_id']} | "
+              f"Duration: {rally['duration_seconds']}s | Shots: {shot_count}")
+        self.current_positions = []
+
+    def _count_shots(self, positions: list) -> int:
+        if len(positions) < 7:
+            return 0
+
+        from scipy.signal import savgol_filter
+
+        xs = [p[1] for p in positions]
+        ys = [p[2] for p in positions]
+        n  = len(ys)
+        w  = min(11, n if n % 2 == 1 else n - 1)
+
+        try:
+            smooth_y = savgol_filter(ys, window_length=w, polyorder=2)
+            smooth_x = savgol_filter(xs, window_length=w, polyorder=2)
+        except Exception:
+            smooth_y, smooth_x = ys, xs
+
+        shot_frames = set()
+        markers     = []
+
+        for i in range(1, len(smooth_y) - 1):
+            y_peak   = smooth_y[i - 1] < smooth_y[i] > smooth_y[i + 1]
+            y_trough = smooth_y[i - 1] > smooth_y[i] < smooth_y[i + 1]
+            x_flip   = (smooth_x[i] - smooth_x[i - 1]) * \
+                       (smooth_x[i + 1] - smooth_x[i]) < 0
+
+            if (y_peak or y_trough) and x_flip:
+                shot_frames.add(i)
+                markers.append(positions[i])
+            elif y_peak or y_trough:
+                shot_frames.add(i)
+                markers.append(positions[i])
+
+        self.last_shot_markers = markers
+        return len(shot_frames)
+
+    def get_summary(self) -> dict:
+        if not self.rallies:
+            return {}
+        return {
+            "total_rallies":        len(self.rallies),
+            "total_shots":          sum(r["shot_count"] for r in self.rallies),
+            "avg_shots_per_rally":  round(
+                sum(r["shot_count"] for r in self.rallies) / len(self.rallies), 1
+            ),
+            "longest_rally_seconds": max(r["duration_seconds"] for r in self.rallies),
+            "rallies":              self.rallies,
+        }
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# 8. CLI Entry Point
+# ══════════════════════════════════════════════════════════════════════════
+
+if __name__ == "__main__":
+    import argparse
+
+    config = load_config()
+
+    parser = argparse.ArgumentParser(
+        description="Badminton shuttle train and track",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    parser.add_argument("--action", required=True,
+                        choices=["train-yolo", "train-obb", "train-tracknet",
+                                 "convert-dataset", "merge-datasets",
+                                 "track", "save-config"])
+
+    # Paths
+    parser.add_argument("--split-dir",         default=get_default(config, "paths", "split_dir"))
+    parser.add_argument("--output-dir",        default=get_default(config, "paths", "output_dir"))
+    parser.add_argument("--yolo-weights",      default=get_default(config, "paths", "yolo_weights"))
+    parser.add_argument("--obb-weights",       default=get_default(config, "paths", "obb_weights"))
+    parser.add_argument("--tracknet-weights",  default=get_default(config, "paths", "tracknet_weights"))
+
+    # Dataset conversion
+    parser.add_argument("--tracknetv2-dir",    help="Root of downloaded TrackNetV2 dataset")
+    parser.add_argument("--converted-dir",     help="Output dir for converted dataset")
+    parser.add_argument("--existing-split-dir",help="Your current annotated splits")
+    parser.add_argument("--merged-output-dir", help="Output for merged dataset")
+    parser.add_argument("--frame-skip",        type=int, default=1)
+    parser.add_argument("--val-ratio",         type=float, default=0.1)
+
+    # Training
+    parser.add_argument("--model-size",    default=get_default(config, "training", "model_size", fallback="n"),
+                        choices=["n", "s", "m", "l", "x"])
+    parser.add_argument("--epochs",        type=int,   default=100)
+    parser.add_argument("--batch",         type=int,   default=get_default(config, "training", "batch", fallback=8))
+    parser.add_argument("--imgsz",         type=int,   default=get_default(config, "training", "imgsz", fallback=640))
+    parser.add_argument("--device",        default=DEVICE)
+    parser.add_argument("--yolo-version",  default=get_default(config, "training", "yolo_version", fallback="11"),
+                        choices=["8", "11"])
+    parser.add_argument("--lr",            type=float, default=1e-4)
+    parser.add_argument("--img-size",      type=int,   default=512)
+    parser.add_argument("--patience",      type=int,   default=15)
+    parser.add_argument("--lr-patience",   type=int,   default=5)
+    parser.add_argument("--sequence-length", type=int, default=3)
+    parser.add_argument("--resume-from",   help="Resume interrupted training")
+    parser.add_argument("--finetune-from", help="Fine-tune from pretrained weights")
+    parser.add_argument("--freeze-layers", type=int, default=0)
+    parser.add_argument("--freeze-encoder", action="store_true")
+
+    # Inference
+    parser.add_argument("--video",         help="Input video for tracking")
+    parser.add_argument("--output-video",  help="Output tracked video")
+    parser.add_argument("--mode",          default=get_default(config, "inference", "mode", fallback="hybrid"),
+                        choices=["yolo", "obb", "tracknet", "hybrid"])
+    parser.add_argument("--conf",          type=float, default=0.25)
+    parser.add_argument("--gap-seconds",   type=float, default=0.5)
+
+    args = parser.parse_args()
+
+    try:
+        if args.action == "save-config":
+            save_config({
+                "paths": {
+                    "split_dir":        args.split_dir,
+                    "output_dir":       args.output_dir,
+                    "yolo_weights":     args.yolo_weights,
+                    "obb_weights":      args.obb_weights,
+                    "tracknet_weights": args.tracknet_weights,
+                },
+                "training": {
+                    "model_size":    args.model_size,
+                    "epochs":        args.epochs,
+                    "batch":         args.batch,
+                    "imgsz":         args.imgsz,
+                    "yolo_version":  args.yolo_version,
+                    "lr":            args.lr,
+                },
+                "inference": {
+                    "mode": args.mode,
+                    "conf": args.conf,
+                },
+            })
+
+        elif args.action == "train-yolo":
+            YOLOTrainer.train_standard(
+                split_dir=args.split_dir, output_dir=args.output_dir,
+                model_size=args.model_size, epochs=args.epochs,
+                imgsz=args.imgsz, batch=args.batch, device=args.device,
+                yolo_version=args.yolo_version, resume_from=args.resume_from,
+                finetune_from=args.finetune_from, freeze_layers=args.freeze_layers,
+            )
+
+        elif args.action == "train-obb":
+            YOLOTrainer.train_obb(
+                split_dir=args.split_dir, output_dir=args.output_dir,
+                model_size=args.model_size, epochs=args.epochs,
+                imgsz=args.imgsz, batch=args.batch, device=args.device,
+                yolo_version=args.yolo_version, resume_from=args.resume_from,
+                finetune_from=args.finetune_from, freeze_layers=args.freeze_layers,
+            )
+
+        elif args.action == "train-tracknet":
+            TrackNetV2Trainer.train(
+                split_dir=args.split_dir, output_dir=args.output_dir,
+                sequence_length=args.sequence_length, img_size=args.img_size,
+                epochs=args.epochs, batch_size=args.batch, lr=args.lr,
+                device=args.device, patience=args.patience,
+                lr_patience=args.lr_patience, resume_from=args.resume_from,
+                finetune_from=args.finetune_from, freeze_encoder=args.freeze_encoder,
+            )
+
+        elif args.action == "convert-dataset":
+            convert_tracknetv2_dataset(
+                tracknetv2_dir=args.tracknetv2_dir,
+                output_split_dir=args.converted_dir,
+                val_ratio=args.val_ratio,
+                frame_skip=args.frame_skip,
+            )
+
+        elif args.action == "merge-datasets":
+            merge_with_existing_data(
+                existing_split_dir=args.existing_split_dir,
+                tracknetv2_split_dir=args.converted_dir,
+                merged_output_dir=args.merged_output_dir,
+            )
+
+        elif args.action == "track":
+            tracker = ShuttleTracker(
+                yolo_weights=args.yolo_weights,
+                obb_weights=args.obb_weights,
+                tracknet_weights=args.tracknet_weights,
+                device=args.device,
+            )
+            tracker.track_video(
+                video_path=args.video,
+                output_path=args.output_video,
+                mode=args.mode,
+                conf_threshold=args.conf,
+            )
+
+    except Exception as e:
+        print(f"\n❌ Error: {e}")
+        import traceback
+        traceback.print_exc()
+        exit(1)
