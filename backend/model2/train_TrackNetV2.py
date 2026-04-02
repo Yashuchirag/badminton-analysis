@@ -8,7 +8,7 @@ from pathlib import Path
 from collections import deque
 from typing import Optional
 
-from TrackNetV2 import TrackNetV2
+from TrackNetV2 import TrackNetV2, TrackNetV2Trainer
 
 try:
     from ultralytics import YOLO
@@ -219,36 +219,22 @@ class YOLOTrainer:
         return model, metrics
 
 
-# ══════════════════════════════════════════════════════════════════════════
-# 2. TrackNetV2 Dataset Converter
-#    Reads: root/amateur/matchX/matchX.csv + matchX.mp4
-#           root/pro/matchX/matchX.csv     + matchX.mp4
-#           root/test/matchX/matchX.csv    + matchX.mp4
-# ══════════════════════════════════════════════════════════════════════════
-
 def convert_tracknetv2_dataset(
     tracknetv2_dir: str,
     output_split_dir: str,
     val_ratio: float = 0.1,
     frame_skip: int = 1,
 ):
-    """
-    Converts TrackNetV2 dataset (MP4 + CSV) into annotations.json format.
-
-    Args:
-        tracknetv2_dir:   Root folder with amateur/, pro/, test/ subdirs
-        output_split_dir: Where to write train/val/test splits
-        val_ratio:        Fraction of matches to reserve for validation
-        frame_skip:       Extract every Nth frame (2 = half the frames)
-    """
     root = Path(tracknetv2_dir)
-    out  = Path(output_split_dir)
+    out = Path(output_split_dir)
     splits = {"train": {}, "val": {}, "test": {}}
 
     # Collect train/val matches from amateur + pro
     trainval_matches = []
-    for category in ["amateur", "pro"]:
+    for category in ["Amateur", "Professional"]:
+        print(f"Processing {category} category...")
         cat_dir = root / category
+        print(cat_dir)
         if not cat_dir.exists():
             print(f"⚠ {category}/ not found — skipping")
             continue
@@ -256,8 +242,8 @@ def convert_tracknetv2_dataset(
             if match_dir.is_dir():
                 trainval_matches.append((category, match_dir))
 
-    n_val         = max(1, int(len(trainval_matches) * val_ratio))
-    val_matches   = trainval_matches[-n_val:]
+    n_val = max(1, int(len(trainval_matches) * val_ratio))
+    val_matches = trainval_matches[-n_val:]
     train_matches = trainval_matches[:-n_val]
 
     print(f"Dataset split: {len(train_matches)} train | {len(val_matches)} val matches")
@@ -267,7 +253,7 @@ def convert_tracknetv2_dataset(
             _process_match(match_dir, category, split_name, out, splits, frame_skip)
 
     # Test folder
-    test_dir = root / "test"
+    test_dir = root / "Test"
     if test_dir.exists():
         for match_dir in sorted(test_dir.iterdir()):
             if match_dir.is_dir():
@@ -285,70 +271,86 @@ def convert_tracknetv2_dataset(
 
 
 def _process_match(match_dir, category, split_name, out, splits, frame_skip):
-    """Extract frames from one match MP4 and read its CSV annotations."""
-    csv_files = list(match_dir.glob("*.csv"))
-    mp4_files = list(match_dir.glob("*.mp4"))
+    csv_dir = match_dir / "csv"
+    vid_dir = match_dir / "video"
 
-    if not csv_files or not mp4_files:
-        print(f"  ⚠ Skipping {match_dir.name} — missing CSV or MP4")
+    if not csv_dir.exists() or not vid_dir.exists():
+        print(f"  ⚠ Skipping {match_dir.name} — missing csv/ or video/ subfolder")
         return
 
-    csv_path   = csv_files[0]
-    mp4_path   = mp4_files[0]
-    match_name = f"{category}_{match_dir.name}"
-    print(f"  Processing {match_name} ...", end=" ", flush=True)
+    csv_files = sorted(csv_dir.glob("*_ball.csv"))
 
-    # Parse CSV: Frame, Visibility, X, Y
-    frame_anns = {}
-    with open(csv_path, "r") as f:
-        reader = csv.reader(f)
-        next(reader, None)  # skip header
-        for row in reader:
-            if len(row) < 4:
-                continue
-            try:
-                frame_num  = int(row[0])
-                visibility = int(row[1])
-                x = float(row[2]) if visibility == 1 else None
-                y = float(row[3]) if visibility == 1 else None
-                frame_anns[frame_num] = {
-                    "visibility": "visible" if visibility == 1 else "not_visible",
-                    "x": x, "y": y,
-                }
-            except (ValueError, IndexError):
-                continue
+    if not csv_files:
+        print(f"  ⚠ Skipping {match_dir.name} — no *_ball.csv files found")
+        return
 
-    # Extract frames from MP4
-    out_img_dir = out / split_name / "images"
-    out_img_dir.mkdir(parents=True, exist_ok=True)
+    match_name  = f"{category}_{match_dir.name}"
+    total_saved = 0
 
-    cap         = cv2.VideoCapture(str(mp4_path))
-    frame_idx   = 0
-    saved_count = 0
+    for csv_path in csv_files:
+        # 1_00_01_ball.csv → rally_name = 1_00_01
+        rally_name = csv_path.stem.replace("_ball", "")
+        mp4_path   = vid_dir / f"{rally_name}.mp4"
 
-    while True:
-        ret, frame = cap.read()
-        if not ret:
-            break
+        if not mp4_path.exists():
+            print(f"  ⚠ No video for rally {rally_name} — skipping")
+            continue
 
-        if frame_idx % frame_skip == 0:
-            unique_name = f"{match_name}_frame{frame_idx:05d}.jpg"
-            out_path    = out_img_dir / unique_name
+        # Parse CSV 
+        frame_anns = {}
+        with open(csv_path, "r") as f:
+            reader = csv.reader(f)
+            next(reader, None)
+            for row in reader:
+                if len(row) < 4:
+                    continue
+                try:
+                    frame_num  = int(row[0])
+                    visibility = int(row[1])
+                    x = float(row[2]) if visibility == 1 else None
+                    y = float(row[3]) if visibility == 1 else None
+                    frame_anns[frame_num] = {
+                        "visibility": "visible" if visibility == 1 else "not_visible",
+                        "x": x,
+                        "y": y,
+                    }
+                except (ValueError, IndexError):
+                    continue
 
-            if not out_path.exists():
-                cv2.imwrite(str(out_path), frame)
+        # Extract frames from MP4
+        out_img_dir = out / split_name / "images"
+        out_img_dir.mkdir(parents=True, exist_ok=True)
 
-            ann = frame_anns.get(frame_idx, {
-                "visibility": "not_visible", "x": None, "y": None,
-            })
-            splits[split_name][unique_name] = ann
-            saved_count += 1
+        cap       = cv2.VideoCapture(str(mp4_path))
+        frame_idx = 0
 
-        frame_idx += 1
+        print(f"  {match_name}/{rally_name} ...", end=" ", flush=True)
 
-    cap.release()
-    print(f"{saved_count} frames")
+        while True:
+            ret, frame = cap.read()
+            if not ret:
+                break
 
+            if frame_idx % frame_skip == 0:
+                # Unique name includes match + rally + frame to avoid collisions
+                unique_name = f"{match_name}_{rally_name}_frame{frame_idx:05d}.jpg"
+                out_path    = out_img_dir / unique_name
+
+                if not out_path.exists():
+                    cv2.imwrite(str(out_path), frame)
+
+                ann = frame_anns.get(frame_idx, {
+                    "visibility": "not_visible", "x": None, "y": None,
+                })
+                splits[split_name][unique_name] = ann
+                total_saved += 1
+
+            frame_idx += 1
+
+        cap.release()
+        print(f"{frame_idx} frames")
+
+    print(f"  ✓ {match_name}: {total_saved} total frames across {len(csv_files)} rallies")
 
 def merge_with_existing_data(
     existing_split_dir: str,
@@ -465,213 +467,6 @@ class TrackNetDataset(Dataset):
 # 5. TrackNetV2 Trainer
 # ══════════════════════════════════════════════════════════════════════════
 
-class TrackNetV2Trainer:
-    """
-    Trainer for TrackNetV2.
-    Key improvements over original:
-      - Early stopping   — no more guessing epoch counts
-      - LR scheduler     — halves LR on plateau automatically
-      - Accuracy metric  — tracks detection accuracy (within 5px) alongside loss
-      - Flexible weight loading — handles old TrackNet → new TrackNetV2 remapping
-    """
-
-    @staticmethod
-    def train(
-        split_dir: str,
-        output_dir: str,
-        sequence_length: int = 3,
-        img_size: int = 512,
-        epochs: int = 100,
-        batch_size: int = 8,
-        lr: float = 1e-4,
-        device: str = DEVICE,
-        patience: int = 15,
-        lr_patience: int = 5,
-        resume_from: Optional[str] = None,
-        finetune_from: Optional[str] = None,
-        freeze_encoder: bool = False,
-        log_every: int = 20,
-    ):
-        if not TORCH_AVAILABLE:
-            raise RuntimeError("PyTorch not installed.")
-
-        if device.isdigit():
-            device = f"cuda:{device}"
-        elif device == "cuda" and not torch.cuda.is_available():
-            print("⚠ CUDA not available, using CPU")
-            device = "cpu"
-
-        if resume_from and finetune_from:
-            raise ValueError("Cannot use both resume_from and finetune_from.")
-
-        train_ds = TrackNetDataset(split_dir, "train", sequence_length, img_size)
-        val_ds = TrackNetDataset(split_dir, "val",   sequence_length, img_size)
-        use_pin = device != "cpu"
-
-        train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True,
-                                  num_workers=4, pin_memory=use_pin)
-        val_loader = DataLoader(val_ds,   batch_size=batch_size, shuffle=False,
-                                  num_workers=4, pin_memory=use_pin)
-
-        model = TrackNetV2(sequence_length).to(device)
-        optimizer = optim.Adam(model.parameters(), lr=lr)
-        criterion = nn.BCELoss()
-        scheduler = optim.lr_scheduler.ReduceLROnPlateau(
-            optimizer, mode="min", factor=0.5, patience=lr_patience, verbose=True
-        )
-
-        start_epoch = 0
-        best_val_loss = float("inf")
-        epochs_no_improve = 0
-        training_mode = "FROM SCRATCH"
-
-        if resume_from:
-            ckpt = torch.load(resume_from, map_location=device)
-            model.load_state_dict(ckpt["model_state_dict"])
-            optimizer.load_state_dict(ckpt["optimizer_state_dict"])
-            start_epoch = ckpt.get("epoch", 0) + 1
-            best_val_loss = ckpt.get("val_loss", float("inf"))
-            training_mode = "RESUME"
-            print(f"Resuming from epoch {start_epoch}")
-
-        elif finetune_from:
-            TrackNetV2Trainer._load_weights_flexible(model, finetune_from, device)
-            training_mode = "FINE-TUNE"
-            if freeze_encoder:
-                for name, param in model.named_parameters():
-                    if any(name.startswith(l) for l in ["enc1", "enc2", "enc3", "bottleneck"]):
-                        param.requires_grad = False
-                optimizer = optim.Adam(
-                    filter(lambda p: p.requires_grad, model.parameters()), lr=lr
-                )
-                print("Encoder frozen — decoder only")
-
-        folder   = "tracknetv2_finetune" if finetune_from else "tracknetv2"
-        save_dir = os.path.join(output_dir, folder)
-        os.makedirs(save_dir, exist_ok=True)
-
-        print(f"\n{'='*70}")
-        print("Training TrackNetV2")
-        print(f"  Mode            : {training_mode}")
-        print(f"  Device          : {device}")
-        print(f"  Train sequences : {len(train_ds)}")
-        print(f"  Val sequences   : {len(val_ds)}")
-        print(f"  Max epochs      : {epochs}  (early stop: {patience})")
-        print(f"  LR              : {lr}  (scheduler patience: {lr_patience})")
-        print(f"{'='*70}\n")
-
-        for epoch in range(start_epoch, start_epoch + epochs):
-            # ── Train ─────────────────────────────────────────────────
-            model.train()
-            train_loss = 0.0
-
-            for batch_idx, (images, heatmaps) in enumerate(train_loader):
-                images   = images.to(device)
-                heatmaps = heatmaps.to(device)
-                optimizer.zero_grad()
-                loss = criterion(model(images), heatmaps)
-                loss.backward()
-                optimizer.step()
-                train_loss += loss.item()
-
-                if (batch_idx + 1) % log_every == 0:
-                    print(f"  Epoch {epoch+1} | Batch {batch_idx+1}/{len(train_loader)} "
-                          f"| Loss: {train_loss / (batch_idx+1):.6f}")
-
-            train_loss /= len(train_loader)
-
-            # ── Validate ──────────────────────────────────────────────
-            model.eval()
-            val_loss    = 0.0
-            val_correct = 0
-            val_total   = 0
-
-            with torch.no_grad():
-                for images, heatmaps in val_loader:
-                    images   = images.to(device)
-                    heatmaps = heatmaps.to(device)
-                    outputs  = model(images)
-                    val_loss += criterion(outputs, heatmaps).item()
-
-                    for pred, gt in zip(outputs.cpu().numpy(), heatmaps.cpu().numpy()):
-                        if gt.max() > 0.5:
-                            py, px = np.unravel_index(pred.argmax(), pred.shape)
-                            gy, gx = np.unravel_index(gt.argmax(),   gt.shape)
-                            dist   = np.sqrt((px - gx) ** 2 + (py - gy) ** 2)
-                            val_correct += 1 if dist <= 5 else 0
-                            val_total   += 1
-
-            val_loss /= len(val_loader)
-            accuracy  = (val_correct / val_total * 100) if val_total > 0 else 0.0
-            scheduler.step(val_loss)
-            current_lr = optimizer.param_groups[0]["lr"]
-
-            print(f"Epoch {epoch+1}/{start_epoch+epochs} | "
-                  f"Train: {train_loss:.6f} | Val: {val_loss:.6f} | "
-                  f"Acc: {accuracy:.1f}% | LR: {current_lr:.2e}")
-
-            # ── Checkpoint ────────────────────────────────────────────
-            torch.save({
-                "epoch": epoch,
-                "model_state_dict":model.state_dict(),
-                "optimizer_state_dict": optimizer.state_dict(),
-                "train_loss": train_loss,
-                "val_loss":val_loss,
-                "accuracy":accuracy,
-            }, os.path.join(save_dir, f"tracknetv2_epoch_{epoch+1}.pth"))
-
-            if val_loss < best_val_loss:
-                best_val_loss = val_loss
-                epochs_no_improve = 0
-                torch.save({
-                    "epoch": epoch,
-                    "model_state_dict":model.state_dict(),
-                    "optimizer_state_dict": optimizer.state_dict(),
-                    "train_loss": train_loss,
-                    "val_loss":val_loss,
-                    "accuracy":accuracy,
-                }, os.path.join(save_dir, "tracknetv2_best.pth"))
-                print(f"  → Best saved (val: {val_loss:.6f}, acc: {accuracy:.1f}%)")
-            else:
-                epochs_no_improve += 1
-                if epochs_no_improve >= patience:
-                    print(f"\n⚡ Early stopping at epoch {epoch+1}")
-                    break
-
-        print(f"\n✓ Training complete | Best val loss: {best_val_loss:.6f}")
-        return model
-
-    @staticmethod
-    def _load_weights_flexible(model: nn.Module, weights_path: str, device: str):
-        """
-        Load weights with automatic remapping from old TrackNet → TrackNetV2.
-        Falls back to partial loading if shapes don't match.
-        """
-        ckpt      = torch.load(weights_path, map_location=device)
-        old_state = ckpt.get("model_state_dict", ckpt)
-        new_state = model.state_dict()
-
-        # Remap old TrackNet layer names to new TrackNetV2 names
-        remap = {
-            "conv1.0.weight": "enc1.0.weight", "conv1.0.bias": "enc1.0.bias",
-            "conv1.2.weight": "enc1.3.weight", "conv1.2.bias": "enc1.3.bias",
-            "conv2.0.weight": "enc2.0.weight", "conv2.0.bias": "enc2.0.bias",
-            "conv2.2.weight": "enc2.3.weight", "conv2.2.bias": "enc2.3.bias",
-            "conv3.0.weight": "enc3.0.weight", "conv3.0.bias": "enc3.0.bias",
-            "conv3.2.weight": "enc3.3.weight", "conv3.2.bias": "enc3.3.bias",
-        }
-        remapped = {remap.get(k, k): v for k, v in old_state.items()}
-        transferred = []
-
-        for name, param in new_state.items():
-            if name in remapped and remapped[name].shape == param.shape:
-                new_state[name] = remapped[name]
-                transferred.append(name)
-
-        model.load_state_dict(new_state)
-        skipped = len(new_state) - len(transferred)
-        print(f"  ✓ Loaded {len(transferred)} layers | "
-              f"⚠ {skipped} layers initialised from scratch")
 
 
 # ══════════════════════════════════════════════════════════════════════════
