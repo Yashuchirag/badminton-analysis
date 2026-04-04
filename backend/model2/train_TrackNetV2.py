@@ -8,7 +8,7 @@ from pathlib import Path
 from collections import deque
 from typing import Optional
 
-from TrackNetV2 import TrackNetV2, TrackNetV2Trainer
+from TrackNetV2 import TrackNetV2, TrackNetV2Trainer, TrackNetDataset
 
 try:
     from ultralytics import YOLO
@@ -108,17 +108,118 @@ class YOLOTrainer:
         return yaml_path
 
     @staticmethod
+    def generate_labels_from_json(split_dir: str, box_size: int = 15):
+        """Auto-generate YOLO .txt label files from annotations.json only if labels are missing."""
+        import cv2
+        from tqdm import tqdm
+
+        print("Checking YOLO labels...")
+        for split in ["train", "val", "test"]:
+            ann_path = Path(split_dir) / split / "annotations.json"
+            img_dir  = Path(split_dir) / split / "images"
+            lbl_dir  = Path(split_dir) / split / "labels"
+            obb_dir  = Path(split_dir) / split / "obb_labels"
+
+            if not ann_path.exists():
+                print(f"  ⚠ No annotations.json for {split}, skipping")
+                continue
+
+            yolo_exists = lbl_dir.exists() and any(lbl_dir.glob("*.txt"))
+            obb_exists  = obb_dir.exists()  and any(obb_dir.glob("*.txt"))
+
+            # Skip if labels already exist 
+            if yolo_exists and obb_exists:
+                print(f"  ✓ {split}: both labels/ and obb_labels/ exist, skipping")
+                continue
+            
+
+            lbl_dir.mkdir(parents=True, exist_ok=True)
+            obb_dir.mkdir(parents=True, exist_ok=True)
+
+            with open(ann_path) as f:
+                annotations = json.load(f)
+
+            converted, skipped, background = 0, 0, 0
+            size_cache = {}
+            half = box_size / 2
+
+            with tqdm(
+                annotations.items(),
+                total=len(annotations),
+                desc=f"  [{split}] Generating labels",
+                unit="label",
+                dynamic_ncols=True,
+                bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]"
+            ) as pbar:
+                for fname, ann in pbar:
+                    stem = Path(fname).stem
+                    yolo_path = lbl_dir / (stem + ".txt")
+                    obb_path  = obb_dir  / (stem + ".txt")
+
+                    if ann.get("visibility") != "visible" or ann.get("x") is None:
+                        yolo_path.write_text("")
+                        obb_path.write_text("")
+                        background += 1
+                        pbar.set_postfix({"labels": converted, "bg": background,
+                                        "skip": skipped}, refresh=False)
+                        continue
+
+                    img_path = str(img_dir / fname)
+                    if img_path not in size_cache:
+                        img = cv2.imread(img_path)
+                        if img is None:
+                            skipped += 1
+                            pbar.set_postfix({"labels": converted, "bg": background,
+                                          "skip": skipped}, refresh=False)
+                            continue
+                        size_cache[img_path] = img.shape[:2]
+
+                    h, w = size_cache[img_path]
+                    ax, ay = float(ann["x"]), float(ann["y"])
+
+                    # ── Standard YOLO: class cx cy bw bh (normalised) ──────
+                    cx = max(0.0, min(1.0, ax / w))
+                    cy = max(0.0, min(1.0, ay / h))
+                    bw = max(0.0, min(1.0, box_size / w))
+                    bh = max(0.0, min(1.0, box_size / h))
+                    yolo_path.write_text(f"0 {cx:.6f} {cy:.6f} {bw:.6f} {bh:.6f}\n")
+
+                    # ── OBB: class x1 y1 x2 y2 x3 y3 x4 y4 (normalised) ──
+                    # Corners: top-left → top-right → bottom-right → bottom-left
+                    x1 = max(0.0, min(1.0, (ax - half) / w))
+                    y1 = max(0.0, min(1.0, (ay - half) / h))
+                    x2 = max(0.0, min(1.0, (ax + half) / w))
+                    y2 = max(0.0, min(1.0, (ay - half) / h))
+                    x3 = max(0.0, min(1.0, (ax + half) / w))
+                    y3 = max(0.0, min(1.0, (ay + half) / h))
+                    x4 = max(0.0, min(1.0, (ax - half) / w))
+                    y4 = max(0.0, min(1.0, (ay + half) / h))
+                    obb_path.write_text(
+                        f"0 {x1:.6f} {y1:.6f} {x2:.6f} {y2:.6f} "
+                        f"{x3:.6f} {y3:.6f} {x4:.6f} {y4:.6f}\n"
+                    )
+                    converted += 1
+                    pbar.set_postfix({"labels": converted, "bg": background, "skip": skipped}, refresh=False)
+
+            print(f"  ✓ {split}: {converted} labels | {background} backgrounds | {skipped} missing images")
+
+
+    @staticmethod
     def train_standard(
         split_dir: str, output_dir: str,
-        model_size: str = "n", epochs: int = 100, imgsz: int = 640,
-        batch: int = 8, device: str = DEVICE, pretrained: bool = True,
+        model_size: str = "n", epochs: int = 20, imgsz: int = 640,
+        batch: int = 32, device: str = DEVICE, pretrained: bool = True,
         yolo_version: str = "8", resume_from: Optional[str] = None,
         finetune_from: Optional[str] = None, freeze_layers: int = 0, **kwargs
     ):
         if not YOLO_AVAILABLE:
             raise RuntimeError("ultralytics not installed.")
         output_dir = os.path.abspath(output_dir)
-        yaml_path  = YOLOTrainer.create_dataset_yaml(split_dir, use_obb=False)
+
+        # Generate .txt labels from annotations.json before anything else
+        YOLOTrainer.generate_labels_from_json(split_dir)
+
+        yaml_path = YOLOTrainer.create_dataset_yaml(split_dir, use_obb=False)
 
         if resume_from:
             model          = YOLO(resume_from)
@@ -150,21 +251,45 @@ class YOLOTrainer:
         print(f"Training YOLOv{yolo_version}{model_size.upper()} Standard | Mode: {training_mode}")
         print(f"{'='*70}")
 
+        # ── Clean epoch-level logging ──────────────────────────────────────
+        def on_epoch_end(trainer):
+            loss = trainer.loss_items
+            print(
+                f"  Epoch {trainer.epoch + 1}/{trainer.epochs} | "
+                f"box: {loss[0]:.4f} | cls: {loss[1]:.4f} | dfl: {loss[2]:.4f}"
+            )
+
+        def on_val_end(trainer):
+            try:
+                map50 = trainer.metrics.box.map50  # correct attribute access
+                print(f"  Val mAP50: {map50:.4f}\n")
+            except Exception as e:
+                print(f"  Val mAP50: unavailable ({e})\n")
+
+        model.add_callback("on_train_epoch_end", on_epoch_end)
+        model.add_callback("on_val_end", on_val_end)
+        # ──────────────────────────────────────────────────────────────────
+
         run_name = "yolo_finetune" if finetune_from else "yolo_standard"
         results  = model.train(
             data=yaml_path, epochs=epochs, imgsz=imgsz, batch=batch,
             device=device, project=output_dir, name=run_name,
             exist_ok=True, pretrained=use_pretrained,
-            resume=bool(resume_from), patience=20, **kwargs
+            resume=bool(resume_from), patience=20,
+            verbose=False,
+            workers=8,
+            cache='ram',
+            **kwargs
         )
         metrics = model.val()
         print(f"\n✓ Standard YOLO complete | mAP50: {metrics.box.map50:.4f}")
         return model, metrics
 
+
     @staticmethod
     def train_obb(
         split_dir: str, output_dir: str,
-        model_size: str = "n", epochs: int = 100, imgsz: int = 640,
+        model_size: str = "n", epochs: int = 20, imgsz: int = 640,
         batch: int = 8, device: str = DEVICE, pretrained: bool = True,
         yolo_version: str = "8", resume_from: Optional[str] = None,
         finetune_from: Optional[str] = None, freeze_layers: int = 0, **kwargs
@@ -172,18 +297,20 @@ class YOLOTrainer:
         if not YOLO_AVAILABLE:
             raise RuntimeError("ultralytics not installed.")
         output_dir = os.path.abspath(output_dir)
+
+        YOLOTrainer.generate_labels_from_json(split_dir)
         yaml_path  = YOLOTrainer.create_dataset_yaml(split_dir, use_obb=True)
 
         if resume_from and finetune_from:
             raise ValueError("Cannot use both resume_from and finetune_from.")
 
         if resume_from:
-            model          = YOLO(resume_from)
-            training_mode  = "RESUME"
+            model = YOLO(resume_from)
+            training_mode = "RESUME"
             use_pretrained = False
         elif finetune_from:
-            model          = YOLO(finetune_from)
-            training_mode  = "FINE-TUNE"
+            model = YOLO(finetune_from)
+            training_mode = "FINE-TUNE"
             use_pretrained = False
             if freeze_layers > 0:
                 for i, (name, param) in enumerate(model.model.named_parameters()):
@@ -199,8 +326,8 @@ class YOLOTrainer:
                 training_mode = "PRETRAINED"
             use_pretrained = True
         else:
-            model          = YOLO(f"yolo{yolo_version}{model_size}-obb.yaml")
-            training_mode  = "FROM-SCRATCH"
+            model = YOLO(f"yolo{yolo_version}{model_size}-obb.yaml")
+            training_mode = "FROM-SCRATCH"
             use_pretrained = False
 
         print(f"\n{'='*70}")
@@ -357,115 +484,100 @@ def merge_with_existing_data(
     tracknetv2_split_dir: str,
     merged_output_dir: str,
 ):
-    """Merge your manually annotated data with converted TrackNetV2 data."""
+    """
+    Auto-discovers all version subfolders inside existing_split_dir.
+    e.g. dataset/processed/ → finds v1/, v2/, v3/ automatically.
+    """
     import shutil
+    from tqdm import tqdm
+
+    parent = Path(existing_split_dir)
+
+    # Auto-discover all subdirs that contain at least one split folder
+    version_dirs = []
+    for subdir in sorted(parent.iterdir()):
+        if subdir.is_dir():
+            has_split = any((subdir / s / "annotations.json").exists()
+                            for s in ["train", "val", "test"])
+            if has_split:
+                version_dirs.append(subdir)
+            else:
+                print(f"  ⚠ Skipping {subdir.name} — no train/val/test found inside")
+
+    if not version_dirs:
+        print(f"❌ No valid version folders found in {existing_split_dir}")
+        return
+
+    print(f"\nFound {len(version_dirs)} version(s): "
+          f"{[d.name for d in version_dirs]}")
+
+    # Sources: (prefix, path)
+    # TrackNetV2 already has unique names so no prefix needed
+    sources = [(d.name, d) for d in version_dirs]
+    if Path(tracknetv2_split_dir).exists():
+        sources.append(("", Path(tracknetv2_split_dir)))
+    else:
+        print(f"  ⚠ TrackNetV2 split dir not found — merging existing versions only")
 
     for split in ["train", "val", "test"]:
-        merged_ann  = {}
+        print(f"\n── {split.upper()} ──────────────────────────")
+        merged_ann = {}
         out_img_dir = Path(merged_output_dir) / split / "images"
         out_img_dir.mkdir(parents=True, exist_ok=True)
 
-        for source_dir in [existing_split_dir, tracknetv2_split_dir]:
-            ann_path = Path(source_dir) / split / "annotations.json"
-            img_dir  = Path(source_dir) / split / "images"
+        for prefix, source_dir in sources:
+            ann_path = source_dir / split / "annotations.json"
+            img_dir = source_dir / split / "images"
+            label = prefix if prefix else "tracknetv2"
+
             if not ann_path.exists():
+                print(f"  ⚠ [{label}] No annotations.json — skipping")
                 continue
+
             with open(ann_path) as f:
                 anns = json.load(f)
-            for fname, ann in anns.items():
-                src = img_dir / fname
-                dst = out_img_dir / fname
-                if src.exists() and not dst.exists():
-                    shutil.copy2(src, dst)
-                merged_ann[fname] = ann
+
+            # tqdm progress bar per source per split
+            skipped = 0
+            with tqdm(
+                anns.items(),
+                total=len(anns),
+                desc=f"  [{label}]",
+                unit="frame",
+                dynamic_ncols=True,              # adapts to terminal width
+                bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} "
+                           "[{elapsed}<{remaining}, {rate_fmt}]",
+            ) as pbar:
+                for fname, ann in pbar:
+                    new_fname = f"{prefix}_{fname}" if prefix else fname
+                    src = img_dir / fname
+                    dst = out_img_dir / new_fname
+
+                    if src.exists():
+                        if not dst.exists():
+                            shutil.copy2(src, dst)
+                        merged_ann[new_fname] = ann
+                    else:
+                        skipped += 1
+
+                    # Live stats in the bar suffix
+                    pbar.set_postfix({
+                        "merged": len(merged_ann),
+                        "missing": skipped,
+                    }, refresh=False)
 
         out_ann = Path(merged_output_dir) / split / "annotations.json"
         with open(out_ann, "w") as f:
             json.dump(merged_ann, f, indent=2)
-        print(f"✓ {split}: {len(merged_ann)} frames merged")
+        print(f"  ✓ {split}: {len(merged_ann)} total frames → {out_ann}")
+
+    print("\n✓ Merge complete!")
 
 
 
-class TrackNetDataset(Dataset):
-    """Dataset for TrackNetV2. Compatible with both your format and TrackNetV2 format."""
-
-    def __init__(self, split_dir: str, split: str = "train",
-                 sequence_length: int = 3, img_size: int = 512):
-        self.img_dir = Path(split_dir) / split / "images"
-        self.ann_path = Path(split_dir) / split / "annotations.json"
-        self.sequence_length = sequence_length
-        self.img_size = img_size
-
-        if not self.ann_path.exists():
-            raise FileNotFoundError(f"annotations.json not found: {self.ann_path}")
-
-        with open(self.ann_path) as f:
-            self.annotations = json.load(f)
-
-        self.frames = sorted(self.annotations.keys())
-        self.valid_indices = [
-            i for i in range(len(self.frames) - sequence_length + 1)
-            if self._are_consecutive(self.frames[i:i + sequence_length])
-        ]
-
-        print(f"TrackNet {split}: {len(self.valid_indices)} sequences "
-              f"(from {len(self.frames)} frames)")
-
-    def _get_prefix_and_num(self, fname: str):
-        import re
-        m = re.match(r"^(.+_frame)(\d+)\.jpg$", fname)
-        if m:
-            return m.group(1), int(m.group(2))
-        m2 = re.search(r"(\d+)", fname)
-        return "default_", int(m2.group(1)) if m2 else 0
-
-    def _are_consecutive(self, frame_list: list) -> bool:
-        prefixes, numbers = [], []
-        for fname in frame_list:
-            p, n = self._get_prefix_and_num(fname)
-            prefixes.append(p)
-            numbers.append(n)
-        if len(set(prefixes)) > 1:
-            return False
-        return all(numbers[i + 1] == numbers[i] + 1 for i in range(len(numbers) - 1))
-
-    def __len__(self):
-        return len(self.valid_indices)
-
-    def __getitem__(self, idx):
-        start      = self.valid_indices[idx]
-        seq_frames = self.frames[start:start + self.sequence_length]
-
-        images = []
-        for fname in seq_frames:
-            img = cv2.imread(str(self.img_dir / fname))
-            if img is None:
-                img = np.zeros((self.img_size, self.img_size, 3), dtype=np.uint8)
-            img = cv2.resize(img, (self.img_size, self.img_size))
-            img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-            images.append(img)
-
-        images = np.array(images).transpose(0, 3, 1, 2).astype(np.float32) / 255.0
-
-        last_ann = self.annotations[seq_frames[-1]]
-        heatmap  = np.zeros((self.img_size, self.img_size), dtype=np.float32)
-
-        if last_ann.get("visibility") == "visible" and last_ann.get("x") is not None:
-            orig = cv2.imread(str(self.img_dir / seq_frames[-1]))
-            if orig is not None:
-                h_orig, w_orig = orig.shape[:2]
-                x = max(0, min(int(float(last_ann["x"]) * self.img_size / w_orig), self.img_size - 1))
-                y = max(0, min(int(float(last_ann["y"]) * self.img_size / h_orig), self.img_size - 1))
-                sigma  = 5
-                yy, xx = np.mgrid[0:self.img_size, 0:self.img_size]
-                heatmap = np.exp(-((xx - x) ** 2 + (yy - y) ** 2) / (2 * sigma ** 2)).astype(np.float32)
-
-        return torch.FloatTensor(images), torch.FloatTensor(heatmap)
 
 
-# ══════════════════════════════════════════════════════════════════════════
-# 5. TrackNetV2 Trainer
-# ══════════════════════════════════════════════════════════════════════════
+
 
 
 
@@ -865,46 +977,46 @@ if __name__ == "__main__":
                                  "track", "save-config"])
 
     # Paths
-    parser.add_argument("--split-dir",         default=get_default(config, "paths", "split_dir"))
-    parser.add_argument("--output-dir",        default=get_default(config, "paths", "output_dir"))
-    parser.add_argument("--yolo-weights",      default=get_default(config, "paths", "yolo_weights"))
-    parser.add_argument("--obb-weights",       default=get_default(config, "paths", "obb_weights"))
-    parser.add_argument("--tracknet-weights",  default=get_default(config, "paths", "tracknet_weights"))
+    parser.add_argument("--split-dir", default=get_default(config, "paths", "split_dir"))
+    parser.add_argument("--output-dir", default=get_default(config, "paths", "output_dir"))
+    parser.add_argument("--yolo-weights", default=get_default(config, "paths", "yolo_weights"))
+    parser.add_argument("--obb-weights", default=get_default(config, "paths", "obb_weights"))
+    parser.add_argument("--tracknet-weights", default=get_default(config, "paths", "tracknet_weights"))
 
     # Dataset conversion
-    parser.add_argument("--tracknetv2-dir",    help="Root of downloaded TrackNetV2 dataset")
-    parser.add_argument("--converted-dir",     help="Output dir for converted dataset")
-    parser.add_argument("--existing-split-dir",help="Your current annotated splits")
+    parser.add_argument("--tracknetv2-dir", help="Root of downloaded TrackNetV2 dataset")
+    parser.add_argument("--converted-dir", help="Output dir for converted dataset")
+    parser.add_argument("--existing-split-dir", help="Your current annotated splits")
     parser.add_argument("--merged-output-dir", help="Output for merged dataset")
-    parser.add_argument("--frame-skip",        type=int, default=1)
-    parser.add_argument("--val-ratio",         type=float, default=0.1)
+    parser.add_argument("--frame-skip", type=int, default=1)
+    parser.add_argument("--val-ratio", type=float, default=0.1)
 
     # Training
-    parser.add_argument("--model-size",    default=get_default(config, "training", "model_size", fallback="n"),
+    parser.add_argument("--model-size", default=get_default(config, "training", "model_size", fallback="n"),
                         choices=["n", "s", "m", "l", "x"])
-    parser.add_argument("--epochs",        type=int,   default=100)
-    parser.add_argument("--batch",         type=int,   default=get_default(config, "training", "batch", fallback=8))
-    parser.add_argument("--imgsz",         type=int,   default=get_default(config, "training", "imgsz", fallback=640))
-    parser.add_argument("--device",        default=DEVICE)
+    parser.add_argument("--epochs", type=int, default=20)
+    parser.add_argument("--batch", type=int, default=get_default(config, "training", "batch", fallback=8))
+    parser.add_argument("--imgsz", type=int, default=get_default(config, "training", "imgsz", fallback=640))
+    parser.add_argument("--device", default=DEVICE)
     parser.add_argument("--yolo-version",  default=get_default(config, "training", "yolo_version", fallback="11"),
                         choices=["8", "11"])
-    parser.add_argument("--lr",            type=float, default=1e-4)
-    parser.add_argument("--img-size",      type=int,   default=512)
-    parser.add_argument("--patience",      type=int,   default=15)
-    parser.add_argument("--lr-patience",   type=int,   default=5)
+    parser.add_argument("--lr", type=float, default=1e-4)
+    parser.add_argument("--img-size", type=int, default=512)
+    parser.add_argument("--patience", type=int, default=15)
+    parser.add_argument("--lr-patience", type=int, default=5)
     parser.add_argument("--sequence-length", type=int, default=3)
-    parser.add_argument("--resume-from",   help="Resume interrupted training")
+    parser.add_argument("--resume-from", help="Resume interrupted training")
     parser.add_argument("--finetune-from", help="Fine-tune from pretrained weights")
     parser.add_argument("--freeze-layers", type=int, default=0)
     parser.add_argument("--freeze-encoder", action="store_true")
 
     # Inference
-    parser.add_argument("--video",         help="Input video for tracking")
-    parser.add_argument("--output-video",  help="Output tracked video")
-    parser.add_argument("--mode",          default=get_default(config, "inference", "mode", fallback="hybrid"),
+    parser.add_argument("--video", help="Input video for tracking")
+    parser.add_argument("--output-video", help="Output tracked video")
+    parser.add_argument("--mode", default=get_default(config, "inference", "mode", fallback="hybrid"),
                         choices=["yolo", "obb", "tracknet", "hybrid"])
-    parser.add_argument("--conf",          type=float, default=0.25)
-    parser.add_argument("--gap-seconds",   type=float, default=0.5)
+    parser.add_argument("--conf", type=float, default=0.25)
+    parser.add_argument("--gap-seconds", type=float, default=0.5)
 
     args = parser.parse_args()
 

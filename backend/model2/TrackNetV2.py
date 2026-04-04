@@ -1,4 +1,8 @@
+import os
+import cv2
+import json
 import numpy as np
+from tqdm import tqdm
 from typing import Optional
 from pathlib import Path
 
@@ -290,3 +294,79 @@ class TrackNetV2Trainer:
         skipped = len(new_state) - len(transferred)
         print(f"  ✓ Loaded {len(transferred)} layers | "
               f"⚠ {skipped} layers initialised from scratch")
+
+class TrackNetDataset(Dataset):
+    """Dataset for TrackNetV2. Compatible with both your format and TrackNetV2 format."""
+
+    def __init__(self, split_dir: str, split: str = "train",
+                 sequence_length: int = 3, img_size: int = 512):
+        self.img_dir = Path(split_dir) / split / "images"
+        self.ann_path = Path(split_dir) / split / "annotations.json"
+        self.sequence_length = sequence_length
+        self.img_size = img_size
+
+        if not self.ann_path.exists():
+            raise FileNotFoundError(f"annotations.json not found: {self.ann_path}")
+
+        with open(self.ann_path) as f:
+            self.annotations = json.load(f)
+
+        self.frames = sorted(self.annotations.keys())
+        self.valid_indices = [
+            i for i in range(len(self.frames) - sequence_length + 1)
+            if self._are_consecutive(self.frames[i:i + sequence_length])
+        ]
+
+        print(f"TrackNet {split}: {len(self.valid_indices)} sequences "
+              f"(from {len(self.frames)} frames)")
+
+    def _get_prefix_and_num(self, fname: str):
+        import re
+        m = re.match(r"^(.+_frame)(\d+)\.jpg$", fname)
+        if m:
+            return m.group(1), int(m.group(2))
+        m2 = re.search(r"(\d+)", fname)
+        return "default_", int(m2.group(1)) if m2 else 0
+
+    def _are_consecutive(self, frame_list: list) -> bool:
+        prefixes, numbers = [], []
+        for fname in frame_list:
+            p, n = self._get_prefix_and_num(fname)
+            prefixes.append(p)
+            numbers.append(n)
+        if len(set(prefixes)) > 1:
+            return False
+        return all(numbers[i + 1] == numbers[i] + 1 for i in range(len(numbers) - 1))
+
+    def __len__(self):
+        return len(self.valid_indices)
+
+    def __getitem__(self, idx):
+        start      = self.valid_indices[idx]
+        seq_frames = self.frames[start:start + self.sequence_length]
+
+        images = []
+        for fname in seq_frames:
+            img = cv2.imread(str(self.img_dir / fname))
+            if img is None:
+                img = np.zeros((self.img_size, self.img_size, 3), dtype=np.uint8)
+            img = cv2.resize(img, (self.img_size, self.img_size))
+            img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+            images.append(img)
+
+        images = np.array(images).transpose(0, 3, 1, 2).astype(np.float32) / 255.0
+
+        last_ann = self.annotations[seq_frames[-1]]
+        heatmap  = np.zeros((self.img_size, self.img_size), dtype=np.float32)
+
+        if last_ann.get("visibility") == "visible" and last_ann.get("x") is not None:
+            orig = cv2.imread(str(self.img_dir / seq_frames[-1]))
+            if orig is not None:
+                h_orig, w_orig = orig.shape[:2]
+                x = max(0, min(int(float(last_ann["x"]) * self.img_size / w_orig), self.img_size - 1))
+                y = max(0, min(int(float(last_ann["y"]) * self.img_size / h_orig), self.img_size - 1))
+                sigma  = 5
+                yy, xx = np.mgrid[0:self.img_size, 0:self.img_size]
+                heatmap = np.exp(-((xx - x) ** 2 + (yy - y) ** 2) / (2 * sigma ** 2)).astype(np.float32)
+
+        return torch.FloatTensor(images), torch.FloatTensor(heatmap)
