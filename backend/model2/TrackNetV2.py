@@ -103,8 +103,8 @@ class TrackNetV2Trainer:
         output_dir: str,
         sequence_length: int = 3,
         img_size: int = 512,
-        epochs: int = 100,
-        batch_size: int = 8,
+        epochs: int = 20,
+        batch_size: int = 16,
         lr: float = 1e-4,
         device: str = DEVICE,
         patience: int = 15,
@@ -131,21 +131,22 @@ class TrackNetV2Trainer:
         use_pin = device != "cpu"
 
         train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True,
-                                  num_workers=4, pin_memory=use_pin)
+                                  num_workers=8, pin_memory=use_pin)
         val_loader = DataLoader(val_ds,   batch_size=batch_size, shuffle=False,
-                                  num_workers=4, pin_memory=use_pin)
+                                  num_workers=8, pin_memory=use_pin)
 
         model = TrackNetV2(sequence_length).to(device)
         optimizer = optim.Adam(model.parameters(), lr=lr)
         criterion = nn.BCELoss()
         scheduler = optim.lr_scheduler.ReduceLROnPlateau(
-            optimizer, mode="min", factor=0.5, patience=lr_patience, verbose=True
+            optimizer, mode="min", factor=0.5, patience=lr_patience
         )
 
         start_epoch = 0
         best_val_loss = float("inf")
         epochs_no_improve = 0
         training_mode = "FROM SCRATCH"
+        prev_lr = lr
 
         if resume_from:
             ckpt = torch.load(resume_from, map_location=device)
@@ -153,6 +154,7 @@ class TrackNetV2Trainer:
             optimizer.load_state_dict(ckpt["optimizer_state_dict"])
             start_epoch = ckpt.get("epoch", 0) + 1
             best_val_loss = ckpt.get("val_loss", float("inf"))
+            prev_lr = optimizer.param_groups[0]["lr"]
             training_mode = "RESUME"
             print(f"Resuming from epoch {start_epoch}")
 
@@ -172,6 +174,8 @@ class TrackNetV2Trainer:
         save_dir = os.path.join(output_dir, folder)
         os.makedirs(save_dir, exist_ok=True)
 
+        total_epochs = start_epoch + epochs
+
         print(f"\n{'='*70}")
         print("Training TrackNetV2")
         print(f"  Mode            : {training_mode}")
@@ -182,13 +186,29 @@ class TrackNetV2Trainer:
         print(f"  LR              : {lr}  (scheduler patience: {lr_patience})")
         print(f"{'='*70}\n")
 
-        for epoch in range(start_epoch, start_epoch + epochs):
-            # ── Train ─────────────────────────────────────────────────
+        epoch_bar = tqdm(
+            range(start_epoch, total_epochs), 
+            desc="Training Tracknet", 
+            unit="epoch",
+            dynamic_ncols=True,
+            bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]"
+        )
+
+        for epoch in epoch_bar:
             model.train()
             train_loss = 0.0
 
-            for batch_idx, (images, heatmaps) in enumerate(train_loader):
-                images   = images.to(device)
+            train_bar = tqdm(
+                train_loader,
+                desc=f"Epoch {epoch+1}/{total_epochs}",
+                unit="batch",
+                leave=False,
+                dynamic_ncols=True,
+                bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}] {postfix}"
+            )
+
+            for batch_idx, (images, heatmaps) in enumerate(train_bar):
+                images = images.to(device)
                 heatmaps = heatmaps.to(device)
                 optimizer.zero_grad()
                 loss = criterion(model(images), heatmaps)
@@ -196,17 +216,27 @@ class TrackNetV2Trainer:
                 optimizer.step()
                 train_loss += loss.item()
 
-                if (batch_idx + 1) % log_every == 0:
-                    print(f"  Epoch {epoch+1} | Batch {batch_idx+1}/{len(train_loader)} "
-                          f"| Loss: {train_loss / (batch_idx+1):.6f}")
-
+                train_bar.set_postfix(
+                    loss=f"{train_loss / (batch_idx+1):.6f}",
+                    refresh=True
+                )
+            
+            train_bar.close()
             train_loss /= len(train_loader)
 
-            # ── Validate ──────────────────────────────────────────────
             model.eval()
             val_loss = 0.0
             val_correct = 0
             val_total = 0
+
+            val_bar = tqdm(
+                val_loader,
+                desc=f"Epoch {epoch+1}/{total_epochs}",
+                unit="batch",
+                leave=False,
+                dynamic_ncols=True,
+                bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}] {postfix}"
+            )
 
             with torch.no_grad():
                 for images, heatmaps in val_loader:
@@ -223,16 +253,39 @@ class TrackNetV2Trainer:
                             val_correct += 1 if dist <= 5 else 0
                             val_total   += 1
 
+                    val_bar.set_postfix(
+                        loss=f"{val_loss / (val_bar.n or 1):.6f}",
+                        refresh=True
+                    )
+            
+            val_bar.close()
             val_loss /= len(val_loader)
-            accuracy  = (val_correct / val_total * 100) if val_total > 0 else 0.0
+            accuracy = (val_correct / val_total * 100) if val_total > 0 else 0.0
+
+            # Scheduler
             scheduler.step(val_loss)
             current_lr = optimizer.param_groups[0]["lr"]
+            if current_lr != prev_lr:
+                print(f"LR changed from {prev_lr:.2e} to {current_lr:.2e}")
+                prev_lr = current_lr
 
-            print(f"Epoch {epoch+1}/{start_epoch+epochs} | "
-                  f"Train: {train_loss:.6f} | Val: {val_loss:.6f} | "
-                  f"Acc: {accuracy:.1f}% | LR: {current_lr:.2e}")
+            # Epoch bar
+            epoch_bar.set_postfix(
+                train_loss=f"{train_loss:.6f}",
+                val_loss=f"{val_loss:.6f}",
+                accuracy=f"{accuracy:.1f}%",
+                lr=f"{current_lr:.2e}",
+                best_val_loss=f"{best_val_loss:.6f}",
+                refresh=True
+            )
 
-            # ── Checkpoint ────────────────────────────────────────────
+            tqdm.write(
+                f"Epoch {epoch+1}/{start_epoch+epochs} | "
+                f"Train: {train_loss:.6f} | Val: {val_loss:.6f} | "
+                f"Acc: {accuracy:.1f}% | LR: {current_lr:.2e}"
+            )
+
+            # Checkpoint
             torch.save({
                 "epoch": epoch,
                 "model_state_dict":model.state_dict(),
@@ -253,14 +306,16 @@ class TrackNetV2Trainer:
                     "val_loss":val_loss,
                     "accuracy":accuracy,
                 }, os.path.join(save_dir, "tracknetv2_best.pth"))
-                print(f"  → Best saved (val: {val_loss:.6f}, acc: {accuracy:.1f}%)")
+                tqdm.write(
+                    f"  → Best saved (val: {val_loss:.6f}, acc: {accuracy:.1f}%)"
+                )
             else:
                 epochs_no_improve += 1
                 if epochs_no_improve >= patience:
-                    print(f"\n⚡ Early stopping at epoch {epoch+1}")
+                    tqdm.write(f"\n⚡ Early stopping at epoch {epoch+1}")
                     break
-
-        print(f"\n✓ Training complete | Best val loss: {best_val_loss:.6f}")
+        epoch_bar.close()
+        tqdm.write(f"\n✓ Training complete | Best val loss: {best_val_loss:.6f}")
         return model
 
     @staticmethod
