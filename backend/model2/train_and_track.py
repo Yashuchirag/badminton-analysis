@@ -6,8 +6,7 @@ import numpy as np
 from pathlib import Path
 from collections import deque
 from typing import Optional
-
-from rally_tracker import RallyDetector
+from TrackNetV2 import TrackNetV2, TrackNetDataset, TrackNetV2Trainer
 
 try:
     from ultralytics import YOLO
@@ -163,7 +162,7 @@ class YOLOTrainer:
         output_dir = os.path.abspath(output_dir)
         yaml_path = YOLOTrainer.create_dataset_yaml(split_dir, use_obb=False)
 
-        # Restart training from your own model
+        # Fine-tuning mode: load your own model
         if resume_from:
             if not os.path.exists(resume_from):
                 raise FileNotFoundError(f"Resume checkpoint not found: {resume_from}")
@@ -214,8 +213,6 @@ class YOLOTrainer:
         if freeze_layers > 0:
             print(f"  Frozen layers: {freeze_layers}")
         print(f"{'='*70}")
-
-        run_name = "yolo_finetune" if finetune_from else "yolo_standard"
         
         # Train
         results = model.train(
@@ -225,7 +222,7 @@ class YOLOTrainer:
                 batch=batch,
                 device=device,
                 project=output_dir,
-                name=run_name,
+                name="yolo_standard",
                 exist_ok=True,
                 pretrained=use_pretrained,
                 resume=bool(resume_from),  # Only resume if resume_from is set
@@ -238,7 +235,7 @@ class YOLOTrainer:
         print(f"\n{'='*70}")
         print("Training Complete - Standard YOLO")
         print(f"{'='*70}")
-        print(f"  Best weights: {output_dir}/{run_name}/weights/best.pt")
+        print(f"  Best weights: {output_dir}/yolo_standard/weights/best.pt")
         print(f"  mAP50: {metrics.box.map50:.4f}")
         print(f"  mAP50-95: {metrics.box.map:.4f}")
         print(f"{'='*70}\n")
@@ -333,8 +330,6 @@ class YOLOTrainer:
         if freeze_layers > 0:
             print(f"  Frozen layers: {freeze_layers}")
         print(f"{'='*70}")
-
-        run_name = "yolo_obb_finetune" if finetune_from else "yolo_obb"
         
         results = model.train(
             data=yaml_path,
@@ -343,7 +338,7 @@ class YOLOTrainer:
             batch=batch,
             device=device,
             project=output_dir,
-            name=run_name,
+            name="yolo_obb",
             exist_ok=True,
             pretrained=use_pretrained,
             resume=bool(resume_from),
@@ -355,7 +350,7 @@ class YOLOTrainer:
         print(f"\n{'='*70}")
         print("Training Complete - YOLOv11-OBB")
         print(f"{'='*70}")
-        print(f"  Best weights: {output_dir}/{run_name}/weights/best.pt")
+        print(f"  Best weights: {output_dir}/yolo_obb/weights/best.pt")
         print(f"  mAP50: {metrics.box.map50:.4f}")
         print(f"  mAP50-95: {metrics.box.map:.4f}")
         print(f"{'='*70}\n")
@@ -363,375 +358,12 @@ class YOLOTrainer:
         return model, metrics
 
 
-class TrackNetDataset(Dataset):
-    """Dataset for TrackNet training (multi-frame input → heatmap output)."""
-    
-    def __init__(self, split_dir: str, split: str = "train",
-                 sequence_length: int = 3, img_size: int = 512):
-        """
-        Args:
-            split_dir: Path to splits/ directory
-            split: 'train', 'val', or 'test'
-            sequence_length: Number of consecutive frames (default: 3)
-            img_size: Input image size
-        """
-        self.img_dir = os.path.join(split_dir, split, "images")
-        self.ann_path = os.path.join(split_dir, split, "annotations.json")
-        self.sequence_length = sequence_length
-        self.img_size = img_size
-        
-        with open(self.ann_path) as f:
-            self.annotations = json.load(f)
-        
-        self.frames = sorted(self.annotations.keys())
-        
-        # Only use frames where we have sequence_length consecutive frames
-        self.valid_indices = []
-        for i in range(len(self.frames) - sequence_length + 1):
-            # Check if frames are consecutive (frame_0001, frame_0002, frame_0003)
-            if self._are_consecutive(self.frames[i:i + sequence_length]):
-                self.valid_indices.append(i)
-        
-        print(f"TrackNet {split}: {len(self.valid_indices)} sequences "
-              f"(from {len(self.frames)} frames)")
-    
-    def _are_consecutive(self, frame_list):
-        """Check if frame names are sequential."""
-        import re
-        numbers = []
-        for frame in frame_list:
-            m = re.findall(r'\d+', frame)
-            if not m:
-                return False
-            numbers.append(int(m[-1]))
-        
-        for i in range(len(numbers) - 1):
-            if numbers[i + 1] != numbers[i] + 1:
-                return False
-        return True
-    
-    def __len__(self):
-        return len(self.valid_indices)
-    
-    def __getitem__(self, idx):
-        start_idx = self.valid_indices[idx]
-        sequence_frames = self.frames[start_idx:start_idx + self.sequence_length]
-        
-        # Load images
-        images = []
-        for frame_name in sequence_frames:
-            img_path = os.path.join(self.img_dir, frame_name)
-            img = cv2.imread(img_path)
-            img = cv2.resize(img, (self.img_size, self.img_size))
-            img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-            images.append(img)
-        
-        images = np.array(images).transpose(0, 3, 1, 2)  # (T, C, H, W)
-        images = images.astype(np.float32) / 255.0
-        
-        # Generate heatmap from last frame's annotation
-        last_frame = sequence_frames[-1]
-        ann = self.annotations[last_frame]
-        
-        heatmap = np.zeros((self.img_size, self.img_size), dtype=np.float32)
-        
-        if ann.get("visibility") in ("visible", "occluded") and "x" in ann:
-            # Get original image size to scale coordinates
-            orig_img = cv2.imread(os.path.join(self.img_dir, last_frame))
-            h_orig, w_orig = orig_img.shape[:2]
-            
-            # Scale to img_size
-            x = int(ann["x"] * self.img_size / w_orig)
-            y = int(ann["y"] * self.img_size / h_orig)
-            
-            # Gaussian heatmap (sigma = 5 pixels)
-            sigma = 5
-            yy, xx = np.mgrid[0:self.img_size, 0:self.img_size]
-            heatmap = np.exp(-((xx - x)**2 + (yy - y)**2) / (2 * sigma**2))
-        
-        return torch.FloatTensor(images), torch.FloatTensor(heatmap)
-
-
-class TrackNet(nn.Module):
-    """TrackNet architecture (VGG-based encoder-decoder for heatmap prediction)."""
-    
-    def __init__(self, sequence_length=3):
-        super().__init__()
-        
-        # Encoder (VGG-style)
-        self.conv1 = nn.Sequential(
-            nn.Conv2d(sequence_length * 3, 64, 3, padding=1),
-            nn.ReLU(),
-            nn.Conv2d(64, 64, 3, padding=1),
-            nn.ReLU(),
-            nn.MaxPool2d(2, 2)
-        )
-        
-        self.conv2 = nn.Sequential(
-            nn.Conv2d(64, 128, 3, padding=1),
-            nn.ReLU(),
-            nn.Conv2d(128, 128, 3, padding=1),
-            nn.ReLU(),
-            nn.MaxPool2d(2, 2)
-        )
-        
-        self.conv3 = nn.Sequential(
-            nn.Conv2d(128, 256, 3, padding=1),
-            nn.ReLU(),
-            nn.Conv2d(256, 256, 3, padding=1),
-            nn.ReLU(),
-            nn.MaxPool2d(2, 2)
-        )
-        
-        # Decoder
-        self.deconv1 = nn.Sequential(
-            nn.ConvTranspose2d(256, 128, 2, stride=2),
-            nn.ReLU()
-        )
-        
-        self.deconv2 = nn.Sequential(
-            nn.ConvTranspose2d(128, 64, 2, stride=2),
-            nn.ReLU()
-        )
-        
-        self.deconv3 = nn.Sequential(
-            nn.ConvTranspose2d(64, 32, 2, stride=2),
-            nn.ReLU()
-        )
-        
-        # Output heatmap
-        self.output = nn.Conv2d(32, 1, 1)
-    
-    def forward(self, x):
-        # x: (B, T, 3, H, W) → flatten temporal + channel dim
-        B, T, C, H, W = x.shape
-        x = x.reshape(B, T * C, H, W)
-        
-        # Encode
-        x1 = self.conv1(x)
-        x2 = self.conv2(x1)
-        x3 = self.conv3(x2)
-        
-        # Decode
-        x = self.deconv1(x3)
-        x = self.deconv2(x)
-        x = self.deconv3(x)
-        
-        # Heatmap
-        x = self.output(x)
-        x = torch.sigmoid(x)
-        
-        return x.squeeze(1)  # (B, H, W)
-
-
-class TrackNetTrainer:
-    """Train TrackNet for temporal shuttle tracking."""
-    
-    @staticmethod
-    def train(
-        split_dir: str,
-        output_dir: str,
-        sequence_length: int = 3,
-        img_size: int = 512,
-        epochs: int = 10,
-        batch_size: int = 8,
-        lr: float = 1e-4,
-        device: str = DEVICE,
-        resume_from: Optional[str] = None,      # Resume interrupted training
-        finetune_from: Optional[str] = None,    # Fine-tune from pre-trained weights
-        freeze_encoder: bool = False 
-    ):
-        """Train TrackNet model.
-        
-        Args:
-            split_dir: Path to rally-aware splits
-            output_dir: Where to save model checkpoints
-            sequence_length: Number of input frames (default: 3)
-            img_size: Input image size
-            epochs: Training epochs
-            batch_size: Batch size
-            lr: Learning rate
-            device: 'cuda' or 'cpu'
-            resume_from: Resume interrupted training from checkpoint
-            finetune_from: Fine-tune from pre-trained model
-            freeze_encoder: If True, freeze encoder layers during fine-tuning
-        """
-        if not TORCH_AVAILABLE:
-            raise RuntimeError("PyTorch not installed. Run: pip install torch torchvision")
-        
-        if device.isdigit():  # If device is "0", "1", etc.
-            device = f"cuda:{device}"
-            print(f"Using device: {device}")
-        elif device == "cuda" and not torch.cuda.is_available():
-            print("⚠ CUDA not available, falling back to CPU")
-            device = "cpu"
-        
-        os.makedirs(output_dir, exist_ok=True)
-
-        # Determine training mode
-        if resume_from and finetune_from:
-            raise ValueError("Cannot use both resume_from and finetune_from simultaneously")
-        
-        # Datasets
-        try:
-            train_dataset = TrackNetDataset(split_dir, "train", sequence_length, img_size)
-            val_dataset = TrackNetDataset(split_dir, "val", sequence_length, img_size)
-        except Exception as e:
-            print(f"❌ Failed to load datasets: {str(e)}")
-            raise
-        
-        train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, 
-                                 num_workers=4, pin_memory=True if device == "cuda" else False)
-        val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, 
-                               num_workers=4, pin_memory=True if device == "cuda" else False)
-        
-        # Model
-        model = TrackNet(sequence_length).to(device)
-        optimizer = optim.Adam(model.parameters(), lr=lr)
-        criterion = nn.MSELoss()
-        
-        start_epoch = 0
-        best_val_loss = float('inf')
-        training_mode = "FROM SCRATCH"
-        
-        # Mode 1: Resume interrupted training
-        if resume_from:
-            if not os.path.exists(resume_from):
-                raise FileNotFoundError(f"Resume checkpoint not found: {resume_from}")
-            
-            print(f"  Loading checkpoint from: {resume_from}")
-            checkpoint = torch.load(resume_from, map_location=device)
-            model.load_state_dict(checkpoint['model_state_dict'])
-            optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-            start_epoch = checkpoint.get('epoch', 0) + 1
-            best_val_loss = checkpoint.get('val_loss', float('inf'))
-            training_mode = "RESUME"
-            print(f"  Resuming from epoch {start_epoch}")
-        
-        # Mode 2: Fine-tune from pre-trained weights
-        elif finetune_from:
-            if not os.path.exists(finetune_from):
-                raise FileNotFoundError(f"Fine-tune checkpoint not found: {finetune_from}")
-            
-            print(f"  Loading pre-trained weights from: {finetune_from}")
-            checkpoint = torch.load(finetune_from, map_location=device)
-            model.load_state_dict(checkpoint['model_state_dict'])
-            training_mode = "FINE-TUNE"
-            
-            # Freeze encoder if requested
-            if freeze_encoder:
-                print(f"  Freezing encoder layers")
-                for name, param in model.named_parameters():
-                    if 'conv1' in name or 'conv2' in name or 'conv3' in name:
-                        param.requires_grad = False
-                
-                # Re-create optimizer with only trainable parameters
-                optimizer = optim.Adam(filter(lambda p: p.requires_grad, model.parameters()), lr=lr)
-            
-            print(f"  Starting fine-tuning from epoch 0")
-        
-        folder_name = "tracknet_finetune" if finetune_from else "tracknet"
-        output_dir = os.path.join(output_dir, folder_name)
-        os.makedirs(output_dir, exist_ok=True)
-
-
-        print(f"\n{'='*70}")
-        print("Training TrackNet")
-        print(f"  Mode: {training_mode}")
-        if freeze_encoder:
-            print(f"  Encoder: FROZEN")
-        print(f"{'='*70}")
-        print(f"  Device: {device}")
-        print(f"  Sequence length: {sequence_length}")
-        print(f"  Image size: {img_size}")
-        print(f"  Train sequences: {len(train_dataset)}")
-        print(f"  Val sequences: {len(val_dataset)}")
-        print(f"{'='*70}\n")
-        
-        for epoch in range(start_epoch, start_epoch + epochs):
-            # Train
-            model.train()
-            train_loss = 0.0
-            
-            for images, heatmaps in train_loader:
-                images = images.to(device)
-                heatmaps = heatmaps.to(device)
-                
-                optimizer.zero_grad()
-                outputs = model(images)
-                loss = criterion(outputs, heatmaps)
-                loss.backward()
-                optimizer.step()
-                
-                train_loss += loss.item()
-
-                # Print progress every 10 batches
-                
-            
-            train_loss /= len(train_loader)
-            
-            # Validate
-            model.eval()
-            val_loss = 0.0
-            
-            with torch.no_grad():
-                for images, heatmaps in val_loader:
-                    images = images.to(device)
-                    heatmaps = heatmaps.to(device)
-                    outputs = model(images)
-                    loss = criterion(outputs, heatmaps)
-                    val_loss += loss.item()
-            
-            val_loss /= len(val_loader)
-            
-            print(f"Epoch {epoch+1}/{epochs}  Train Loss: {train_loss:.6f}  Val Loss: {val_loss:.6f}")
-            
-            # Save checkpoint every epoch
-            checkpoint_path = os.path.join(output_dir, f'tracknet_epoch_{epoch+1}.pth')
-            torch.save({
-                'epoch': epoch,
-                'model_state_dict': model.state_dict(),
-                'optimizer_state_dict': optimizer.state_dict(),
-                'train_loss': train_loss,
-                'val_loss': val_loss,
-            }, checkpoint_path)
-
-            # Save best model
-            if val_loss < best_val_loss:
-                best_val_loss = val_loss
-                best_path = os.path.join(output_dir, 'tracknet_best.pth')
-                torch.save({
-                    'epoch': epoch,
-                    'model_state_dict': model.state_dict(),
-                    'optimizer_state_dict': optimizer.state_dict(),
-                    'train_loss': train_loss,
-                    'val_loss': val_loss,
-                }, best_path)
-                print(f"  → Saved best model (val_loss: {val_loss:.6f})")
-        
-        print(f"\n{'='*70}")
-        print("TrackNet Training Complete")
-        print(f"{'='*70}")
-        print(f"  Best weights: {output_dir}/tracknet/tracknet_best.pth")
-        print(f"  Best val loss: {best_val_loss:.6f}")
-        print(f"{'='*70}\n")
-        
-        return model
-
-
-
 class ShuttleTracker:
     """Unified inference for YOLO, TrackNet, and hybrid tracking."""
     
     def __init__(self, yolo_weights=None, obb_weights=None, tracknet_weights=None,
                  device=DEVICE):
-        """
-        Args:
-            yolo_weights: Path to YOLO standard weights
-            obb_weights: Path to YOLO-OBB weights
-            tracknet_weights: Path to TrackNet weights
-            device: 'cuda' or 'cpu'
-        """
+
         self.device = device
         self.yolo_model = None
         self.obb_model = None
@@ -754,7 +386,7 @@ class ShuttleTracker:
         
         if tracknet_weights and TORCH_AVAILABLE:
             checkpoint = torch.load(tracknet_weights, map_location=self.device)
-            self.tracknet_model = TrackNet(sequence_length=3).to(self.device)
+            self.tracknet_model = TrackNetV2(sequence_length=3).to(self.device)
             self.tracknet_model.load_state_dict(checkpoint['model_state_dict'])
             self.tracknet_model.eval()
             print(f"✓ Loaded TrackNet: {tracknet_weights}")
@@ -763,18 +395,8 @@ class ShuttleTracker:
     
     def track_video(self, video_path: str, output_path: str,
                     mode: str = "hybrid", conf_threshold: float = 0.25,
-                    show_trail: bool = True, trail_length: int = 30,
-                    save_analytics: bool = True):
-        """Track shuttle in video and save annotated output.
+                    show_trail: bool = True, trail_length: int = 30):
         
-        Args:
-            video_path: Input video path
-            output_path: Output video path
-            mode: 'yolo' | 'obb' | 'tracknet' | 'hybrid'
-            conf_threshold: Confidence threshold for YOLO detections
-            show_trail: Show shuttle trajectory trail
-            trail_length: Number of past positions to show
-        """
         cap = cv2.VideoCapture(video_path)
         fps = int(cap.get(cv2.CAP_PROP_FPS))
         width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
@@ -785,7 +407,6 @@ class ShuttleTracker:
         
         trail = deque(maxlen=trail_length)
         frame_idx = 0
-        rally_detector = RallyDetector(fps=fps)
         
         print(f"\nTracking video: {video_path}")
         print(f"  Mode: {mode}")
@@ -834,14 +455,7 @@ class ShuttleTracker:
                 
                 # Draw current position
                 cv2.circle(frame, (x, y), 12, (0, 255, 0), 2)
-            
-            rally_detector.update(frame_idx, position)
-            current_rally_num = len(rally_detector.rallies) + (
-                1 if rally_detector.state == "IN_PLAY" else 0
-            )
-            cv2.putText(frame, f"Rally: {current_rally_num}  Shots: {len(rally_detector.current_positions)//4}",
-                   (10, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 200, 255), 2)
-            
+                
             # Info overlay
             cv2.putText(frame, f"Frame: {frame_idx}  Mode: {mode.upper()}",
                        (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
@@ -860,14 +474,6 @@ class ShuttleTracker:
         
         print(f"✓ Tracking complete → {output_path}")
         print(f"  Frames processed: {frame_idx}")
-        if save_analytics:
-            summary = rally_detector.get_summary()
-            analytics_path = output_path.replace(".mp4", "_analytics.json")
-            with open(analytics_path, "w") as f:
-                json.dump(summary, f, indent=4)
-            print(f"✓ Analytics saved → {analytics_path}")
-
-        return rally_detector.get_summary()
     
     def _detect_yolo(self, frame, model, conf_threshold, is_obb=False):
         results = model(frame, conf=conf_threshold, verbose=False)
@@ -944,6 +550,7 @@ class ShuttleTracker:
             return (x, y)
         return None
 
+
 if __name__ == "__main__":
     import argparse
     
@@ -1008,12 +615,6 @@ if __name__ == "__main__":
     parser.add_argument("--conf",        type=float,
                         default=get_default(config, "inference", "conf",     fallback=0.25))
     
-    # Rally tracking args
-    parser.add_argument("--gap-seconds", type=float, default=0.5,
-                        help="Seconds of no detection to end a rally")
-    parser.add_argument("--save-analytics", action="store_true",
-                        help="Save rally analytics JSON alongside output video")
-    
     args = parser.parse_args()
     
     try:
@@ -1076,7 +677,7 @@ if __name__ == "__main__":
             )
         
         elif args.action == "train-tracknet":
-            TrackNetTrainer.train(
+            TrackNetV2Trainer.train(
                 split_dir=args.split_dir,
                 output_dir=args.output_dir,
                 sequence_length=args.sequence_length,

@@ -2,9 +2,9 @@
     "paths": {
         "split_dir": "./dataset/merged_split",
         "output_dir": "./models/final",
-        "yolo_weights": "./models/shuttle/yolo_finetune/weights/best.pt",
-        "obb_weights": "./models/shuttle/yolo_obb_finetune/weights/best.pt",
-        "tracknet_weights": "./models/shuttle/tracknet_finetune/tracknet_best.pth"
+        "yolo_weights": "./models/claudette_trained/yolo_standard/weights/best.pt",
+        "obb_weights": "./models/claudette_trained/yolo_obb/weights/best.pt",
+        "tracknet_weights": "./models/claudette_trained/tracknetv2/tracknetv2_best.pth"
     },
     "training": {
         "model_size": "n",
