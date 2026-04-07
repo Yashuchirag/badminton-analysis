@@ -2,10 +2,12 @@ import os
 import yaml
 import json
 import cv2
+import threading
 import numpy as np
 from pathlib import Path
 from collections import deque
 from typing import Optional
+from queue import Queue, Empty
 from TrackNetV2 import TrackNetV2, TrackNetDataset, TrackNetV2Trainer
 
 try:
@@ -27,6 +29,8 @@ except ImportError:
 
 
 CONFIG_FILE = os.path.join(os.path.dirname(__file__), "shuttle_config.json")
+INFERENCE_SIZE = 416
+TRACKNET_SIZE = 256
 
 def load_config() -> dict:
     """Load config from shuttle_config.json if it exists."""
@@ -362,9 +366,10 @@ class ShuttleTracker:
     """Unified inference for YOLO, TrackNet, and hybrid tracking."""
     
     def __init__(self, yolo_weights=None, obb_weights=None, tracknet_weights=None,
-                 device=DEVICE):
+                 device=DEVICE, use_fp16=True, use_compile=True):
 
         self.device = device
+        self.use_fp16 = use_fp16
         self.yolo_model = None
         self.obb_model = None
         self.tracknet_model = None
@@ -375,7 +380,11 @@ class ShuttleTracker:
         elif self.device == "cuda" and not torch.cuda.is_available():
             print("⚠ CUDA not available, falling back to CPU")
             self.device = "cpu"
+            self.use_fp16 = False
         
+        use_cuda = "cuda" in self.device
+        print(f"Using device: {self.device}  FP16={self.use_fp16 and use_cuda}")
+
         if yolo_weights and YOLO_AVAILABLE:
             self.yolo_model = YOLO(yolo_weights)
             print(f"✓ Loaded YOLO: {yolo_weights}")
@@ -389,13 +398,26 @@ class ShuttleTracker:
             self.tracknet_model = TrackNetV2(sequence_length=3).to(self.device)
             self.tracknet_model.load_state_dict(checkpoint['model_state_dict'])
             self.tracknet_model.eval()
+            
+            if use_cuda and self.use_fp16:
+                self.tracknet_model.half()
+
+            # torch.compile gives 10-30% speedup on PyTorch 2.0+
+            if use_compile and hasattr(torch, "compile"):
+                try:
+                    self.tracknet_model = torch.compile(self.tracknet_model)
+                    print("✓ torch.compile applied to TrackNet")
+                except Exception as e:
+                    print(f"⚠ torch.compile skipped: {e}")
+
             print(f"✓ Loaded TrackNet: {tracknet_weights}")
         
         self.frame_buffer = deque(maxlen=3)  # For TrackNet multi-frame input
     
     def track_video(self, video_path: str, output_path: str,
                     mode: str = "hybrid", conf_threshold: float = 0.25,
-                    show_trail: bool = True, trail_length: int = 30):
+                    show_trail: bool = True, trail_length: int = 30, batch_size: int = 8,
+                    yolo_conf_skip_tracknet: float = 0.65):
         
         cap = cv2.VideoCapture(video_path)
         fps = int(cap.get(cv2.CAP_PROP_FPS))
@@ -405,76 +427,208 @@ class ShuttleTracker:
         fourcc = cv2.VideoWriter_fourcc(*'mp4v')
         out = cv2.VideoWriter(output_path, fourcc, fps, (width, height))
         
+        print(f"\nTracking video : {video_path}")
+        print(f"  Mode         : {mode}")
+        print(f"  Resolution   : {width}x{height}  FPS: {fps}")
+        print(f"  Batch size   : {batch_size}")
+        print(f"  Infer size   : YOLO={INFERENCE_SIZE}, TrackNet={TRACKNET_SIZE}")
+        
+        read_queue = Queue(maxsize=batch_size * 4)
+        write_queue = Queue(maxsize=batch_size * 4)
+
+        def _reader():
+            while True:
+                ret, frame = cap.read()
+                if not ret:
+                    read_queue.put(None)
+                    break
+                read_queue.put(frame)
+
+        def _writer():
+            while True:
+                item = write_queue.get()
+                if item is None:
+                    break
+                out.write(item)
+
+        threading.Thread(target=_reader, daemon=True).start()
+        writer_t = threading.Thread(target=_writer, daemon=True)
+        writer_t.start()
+
         trail = deque(maxlen=trail_length)
         frame_idx = 0
-        
-        print(f"\nTracking video: {video_path}")
-        print(f"  Mode: {mode}")
-        print(f"  FPS: {fps}  Resolution: {width}x{height}")
-        
-        while True:
-            ret, frame = cap.read()
-            if not ret:
+        done = False
+
+        while not done:
+            batch_frames = []
+            while len(batch_frames) < batch_size:
+                try:
+                    frame = read_queue.get(timeout=5)
+                except Empty:
+                    done = True
+                    break
+                if frame is None:
+                    done = True
+                    break
+                batch_frames.append(frame)
+
+            if not batch_frames:
                 break
             
-            # Get detection/prediction
-            if mode == "yolo" and self.yolo_model:
-                position = self._detect_yolo(frame, self.yolo_model, conf_threshold)
+            positions = self._process_batch(
+                batch_frames, mode, conf_threshold, 
+                yolo_conf_skip_tracknet, width, height
+            )
             
-            elif mode == "obb" and self.obb_model:
-                position = self._detect_yolo(frame, self.obb_model, conf_threshold, is_obb=True)
-            
-            elif mode == "tracknet" and self.tracknet_model:
-                position = self._detect_tracknet(frame)
-            
-            elif mode == "hybrid":
-                # Use YOLO for detection, TrackNet for refinement
-                yolo_pos = None
-                if self.obb_model:
-                    yolo_pos = self._detect_yolo(frame, self.obb_model, conf_threshold, is_obb=True)
-                elif self.yolo_model:
-                    yolo_pos = self._detect_yolo(frame, self.yolo_model, conf_threshold)
-                
-                tracknet_pos = self._detect_tracknet(frame) if self.tracknet_model else None
-                
-                # Fusion: if both agree (within 50px), use TrackNet (more precise)
-                # Otherwise use YOLO (more robust)
-                if yolo_pos and tracknet_pos:
-                    dist = np.sqrt((yolo_pos[0] - tracknet_pos[0])**2 +
-                                  (yolo_pos[1] - tracknet_pos[1])**2)
-                    position = tracknet_pos if dist < 50 else yolo_pos
-                else:
-                    position = yolo_pos or tracknet_pos
-            else:
-                position = None
-            
-            # Visualize
-            if position:
-                x, y = int(position[0]), int(position[1])
-                trail.append((x, y))
-                
-                # Draw current position
-                cv2.circle(frame, (x, y), 12, (0, 255, 0), 2)
-                
-            # Info overlay
-            cv2.putText(frame, f"Frame: {frame_idx}  Mode: {mode.upper()}",
-                       (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-            if position:
-                cv2.putText(frame, f"Position: ({int(position[0])}, {int(position[1])})",
-                           (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-            
-            out.write(frame)
-            frame_idx += 1
-            
-            if frame_idx % 100 == 0:
-                print(f"  Processed {frame_idx} frames...")
-        
+            for frame, position in zip(batch_frames, positions):
+                if position:
+                    x, y = int(position[0]), int(position[1])
+                    trail.append((x, y))
+                    cv2.circle(frame, (x, y), 12, (0, 255, 0), 2)
+
+                    # Draw motion trail
+                    if show_trail and len(trail) > 1:
+                        pts = list(trail)
+                        for i in range(1, len(pts)):
+                            alpha = i / len(pts)
+                            color = (0, int(255 * alpha), int(100 * (1 - alpha)))
+                            cv2.line(frame, pts[i - 1], pts[i], color, 2)
+
+                cv2.putText(frame, f"Frame: {frame_idx}  Mode: {mode.upper()}",
+                    (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+                if position:
+                    cv2.putText(frame, f"Pos: ({int(position[0])}, {int(position[1])})",
+                        (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+
+                write_queue.put(frame)
+                frame_idx += 1
+
+            if frame_idx % 200 == 0 and frame_idx > 0:
+                print(f"  Processed {frame_idx} frames…")
+
+        # ── Teardown ──────────────────────────────────────────────────────────
+        write_queue.put(None)
+        writer_t.join()
         cap.release()
         out.release()
-        
+
         print(f"✓ Tracking complete → {output_path}")
-        print(f"  Frames processed: {frame_idx}")
+        print(f"  Total frames : {frame_idx}")
     
+
+    def _process_batch(
+                self,
+                frames: list,
+                mode: str,
+                conf_threshold: float,
+                width: int,
+                height: int,
+                yolo_conf_skip_tracknet: float,
+            ) -> list:
+        
+        positions = [None] * len(frames)
+        use_half = "cuda" in self.device and self.use_fp16
+
+        # Resize all frames once for inference
+        infer_frames = [cv2.resize(f, (INFERENCE_SIZE, INFERENCE_SIZE)) for f in frames]
+        scale_x = width / INFERENCE_SIZE
+        scale_y = height / INFERENCE_SIZE
+
+        def _scale(pos):
+            if pos is None:
+                return None
+            return (pos[0] * scale_x, pos[1] * scale_y)
+
+        # YOLO-only 
+        if mode == "yolo" and self.yolo_model:
+            results = self.yolo_model(
+                infer_frames, conf=conf_threshold, verbose=False, stream=False, half=use_half
+            )
+            for i, r in enumerate(results):
+                positions[i] = _scale(self._extract_box(r, is_obb=False))
+
+        # OBB-only 
+        elif mode == "obb" and self.obb_model:
+            results = self.obb_model(
+                infer_frames, conf=conf_threshold, verbose=False, stream=False, half=use_half
+            )
+            for i, r in enumerate(results):
+                positions[i] = _scale(self._extract_box(r, is_obb=True))
+
+        # TrackNet-only (frame-by-frame; no batching in TrackNet) 
+        elif mode == "tracknet" and self.tracknet_model:
+            for i, frame in enumerate(frames):
+                positions[i] = self._detect_tracknet(frame, width, height)
+
+        # Hybrid (batched YOLO + selective TrackNet) 
+        elif mode == "hybrid":
+            model = self.obb_model or self.yolo_model
+            is_obb = self.obb_model is not None
+
+            if model:
+                results = model(
+                    infer_frames, conf=conf_threshold, verbose=False, stream=False, half=use_half
+                )
+                yolo_positions = []
+                yolo_confs = []
+                for r in results:
+                    pos, conf = self._extract_box_with_conf(r, is_obb=is_obb)
+                    yolo_positions.append(_scale(pos))
+                    yolo_confs.append(conf)
+            else:
+                yolo_positions = [None] * len(frames)
+                yolo_confs = [0.0] * len(frames)
+
+            for i, frame in enumerate(frames):
+                yolo_pos = yolo_positions[i]
+                yolo_conf = yolo_confs[i]
+                
+                if yolo_conf >= yolo_conf_skip_tracknet or self.tracknet_model is None:
+                    positions[i] = yolo_pos
+                    continue
+
+                tracknet_pos = self._detect_tracknet(frame, width, height)
+
+                if yolo_pos and tracknet_pos:
+                    dist = np.hypot(
+                        yolo_pos[0] - tracknet_pos[0],
+                        yolo_pos[1] - tracknet_pos[1],
+                    )
+                    positions[i] = tracknet_pos if dist < 50 else yolo_pos
+                else:
+                    positions[i] = yolo_pos or tracknet_pos
+
+        return positions
+
+
+    def _extract_box(self, r, is_obb: bool):
+        pos, _ = self._extract_box_with_conf(r, is_obb)
+        return pos
+
+    def _extract_box_with_conf(self, r, is_obb: bool):
+        """Return ((cx, cy), best_confidence) or (None, 0.0)."""
+        if is_obb:
+            if not hasattr(r, "obb") or r.obb is None or r.obb.conf is None:
+                return None, 0.0
+            confs = r.obb.conf.cpu().numpy()
+            if len(confs) == 0:
+                return None, 0.0
+            best_idx = int(np.argmax(confs))
+            corners = r.obb.xyxyxyxy.cpu().numpy()[best_idx]
+            cx = corners[:, 0].mean()
+            cy = corners[:, 1].mean()
+            return (cx, cy), float(confs[best_idx])
+        else:
+            if r.boxes is None or r.boxes.conf is None:
+                return None, 0.0
+            confs = r.boxes.conf.cpu().numpy()
+            if len(confs) == 0:
+                return None, 0.0
+            best_idx = int(np.argmax(confs))
+            x1, y1, x2, y2 = r.boxes.xyxy.cpu().numpy()[best_idx]
+            return ((x1 + x2) / 2, (y1 + y2) / 2), float(confs[best_idx])
+
+        
     def _detect_yolo(self, frame, model, conf_threshold, is_obb=False):
         results = model(frame, conf=conf_threshold, verbose=False)
         r = results[0]
@@ -509,7 +663,7 @@ class ShuttleTracker:
             return ((x1 + x2) / 2, (y1 + y2) / 2)
 
     
-    def _detect_tracknet(self, frame):
+    def _detect_tracknet(self, frame, width: int, height: int):
         """Run TrackNet prediction on frame."""
         if self.tracknet_model is None:
             return None
@@ -520,36 +674,35 @@ class ShuttleTracker:
         if len(self.frame_buffer) < 3:
             return None
         
-        # Prepare input
-        frames = list(self.frame_buffer)
-        img_size = 512
-        
         images = []
-        for f in frames:
-            img = cv2.resize(f, (img_size, img_size))
+        for f in self.frame_buffer:
+            img = cv2.resize(f, (TRACKNET_SIZE, TRACKNET_SIZE))
             img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
             images.append(img)
-        
-        images = np.array(images).transpose(0, 3, 1, 2).astype(np.float32) / 255.0
-        images = torch.FloatTensor(images).unsqueeze(0).to(self.device)
-        
-        # Predict
-        with torch.no_grad():
-            heatmap = self.tracknet_model(images).cpu().numpy()[0]
-        
-        # Find peak
-        y_max, x_max = np.unravel_index(heatmap.argmax(), heatmap.shape)
-        
-        # Scale back to original frame size
-        h, w = frame.shape[:2]
-        x = x_max * w / img_size
-        y = y_max * h / img_size
-        
-        # Only return if heatmap confidence is high
-        if heatmap[y_max, x_max] > 0.5:
-            return (x, y)
-        return None
 
+        arr = np.array(images).transpose(0, 3, 1, 2).astype(np.float32) / 255.0
+        tensor = torch.FloatTensor(arr).unsqueeze(0)
+
+        # Non-blocking transfer to GPU
+        if "cuda" in self.device:
+            tensor = tensor.pin_memory().to(self.device, non_blocking=True)
+            if self.use_fp16:
+                tensor = tensor.half()
+        else:
+            tensor = tensor.to(self.device)
+
+        with torch.no_grad():
+            heatmap = self.tracknet_model(tensor).cpu().float().numpy()[0]
+
+        y_max, x_max = np.unravel_index(heatmap.argmax(), heatmap.shape)
+
+        if heatmap[y_max, x_max] <= 0.5:
+            return None
+
+        # Scale to original resolution
+        x = x_max * width / TRACKNET_SIZE
+        y = y_max * height / TRACKNET_SIZE
+        return (x, y)
 
 if __name__ == "__main__":
     import argparse
