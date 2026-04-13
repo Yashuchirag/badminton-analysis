@@ -540,7 +540,7 @@ class ShuttleTracker:
             return (pos[0] * scale_x, pos[1] * scale_y)
 
         # YOLO-only 
-        if mode == "yolo" and self.yolo_model:
+        if mode == "yolo" and self.yolo_model is not None:
             results = self.yolo_model(
                 infer_frames, conf=conf_threshold, verbose=False, stream=False, half=use_half
             )
@@ -548,7 +548,7 @@ class ShuttleTracker:
                 positions[i] = _scale(self._extract_box(r, is_obb=False))
 
         # OBB-only 
-        elif mode == "obb" and self.obb_model:
+        elif mode == "obb" and self.obb_model is not None:
             results = self.obb_model(
                 infer_frames, conf=conf_threshold, verbose=False, stream=False, half=use_half
             )
@@ -556,16 +556,16 @@ class ShuttleTracker:
                 positions[i] = _scale(self._extract_box(r, is_obb=True))
 
         # TrackNet-only (frame-by-frame; no batching in TrackNet) 
-        elif mode == "tracknet" and self.tracknet_model:
+        elif mode == "tracknet" and self.tracknet_model is not None:
             for i, frame in enumerate(frames):
                 positions[i] = self._detect_tracknet(frame, width, height)
 
         # Hybrid (batched YOLO + selective TrackNet) 
         elif mode == "hybrid":
-            model = self.obb_model or self.yolo_model
+            model = self.obb_model if self.obb_model is not None else self.yolo_model
             is_obb = self.obb_model is not None
 
-            if model:
+            if model is not None:
                 results = model(
                     infer_frames, conf=conf_threshold, verbose=False, stream=False, half=use_half
                 )

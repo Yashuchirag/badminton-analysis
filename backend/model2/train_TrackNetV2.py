@@ -3,6 +3,8 @@ import yaml
 import json
 import csv
 import cv2
+import shutil
+from tqdm import tqdm
 import numpy as np
 from pathlib import Path
 from collections import deque
@@ -202,7 +204,7 @@ class YOLOTrainer:
     @staticmethod
     def train_standard(
         split_dir: str, output_dir: str,
-        model_size: str = "n", epochs: int = 20, imgsz: int = 640,
+        model_size: str = "n", epochs: int = 100, imgsz: int = 640,
         batch: int = 32, device: str = DEVICE, pretrained: bool = True,
         yolo_version: str = "8", resume_from: Optional[str] = None,
         finetune_from: Optional[str] = None, freeze_layers: int = 0, **kwargs
@@ -246,24 +248,8 @@ class YOLOTrainer:
         print(f"Training YOLOv{yolo_version}{model_size.upper()} Standard | Mode: {training_mode}")
         print(f"{'='*70}")
 
-        # ── Clean epoch-level logging ──────────────────────────────────────
-        def on_epoch_end(trainer):
-            loss = trainer.loss_items
-            print(
-                f"  Epoch {trainer.epoch + 1}/{trainer.epochs} | "
-                f"box: {loss[0]:.4f} | cls: {loss[1]:.4f} | dfl: {loss[2]:.4f}"
-            )
-
-        def on_val_end(trainer):
-            try:
-                map50 = trainer.metrics.box.map50  # correct attribute access
-                print(f"  Val mAP50: {map50:.4f}\n")
-            except Exception as e:
-                print(f"  Val mAP50: unavailable ({e})\n")
-
         model.add_callback("on_train_epoch_end", on_epoch_end)
         model.add_callback("on_val_end", on_val_end)
-        # ──────────────────────────────────────────────────────────────────
 
         run_name = "yolo_finetune" if finetune_from else "yolo_standard"
         results  = model.train(
@@ -284,7 +270,7 @@ class YOLOTrainer:
     @staticmethod
     def train_obb(
         split_dir: str, output_dir: str,
-        model_size: str = "n", epochs: int = 20, imgsz: int = 640,
+        model_size: str = "n", epochs: int = 100, imgsz: int = 640,
         batch: int = 8, device: str = DEVICE, pretrained: bool = True,
         yolo_version: str = "8", resume_from: Optional[str] = None,
         finetune_from: Optional[str] = None, freeze_layers: int = 0, **kwargs
@@ -330,16 +316,34 @@ class YOLOTrainer:
         print(f"{'='*70}")
 
         run_name = "yolo_obb_finetune" if finetune_from else "yolo_obb"
+        model.add_callback("on_train_epoch_end", on_epoch_end)
+        model.add_callback("on_val_end", on_val_end)
+
         results  = model.train(
             data=yaml_path, epochs=epochs, imgsz=imgsz, batch=batch,
             device=device, project=output_dir, name=run_name,
             exist_ok=True, pretrained=use_pretrained,
-            resume=bool(resume_from), patience=20, **kwargs
+            resume=bool(resume_from), patience=20, verbose=False,
+            workers=8, cache='ram', **kwargs
         )
         metrics = model.val()
         print(f"\n✓ OBB YOLO complete | mAP50: {metrics.box.map50:.4f}")
         return model, metrics
+    
+    
+def on_epoch_end(trainer):
+    loss = trainer.loss_items
+    print(
+        f"  Epoch {trainer.epoch + 1}/{trainer.epochs} | "
+        f"box: {loss[0]:.4f} | cls: {loss[1]:.4f} | dfl: {loss[2]:.4f}"
+    )
 
+def on_val_end(trainer):
+    try:
+        map50 = trainer.metrics.box.map50  # correct attribute access
+        print(f"  Val mAP50: {map50:.4f}\n")
+    except Exception as e:
+        print(f"  Val mAP50: unavailable ({e})\n")
 
 def convert_tracknetv2_dataset(
     tracknetv2_dir: str,
@@ -483,8 +487,7 @@ def merge_with_existing_data(
     Auto-discovers all version subfolders inside existing_split_dir.
     e.g. dataset/processed/ → finds v1/, v2/, v3/ automatically.
     """
-    import shutil
-    from tqdm import tqdm
+    
 
     parent = Path(existing_split_dir)
 
@@ -600,13 +603,13 @@ if __name__ == "__main__":
     # Training
     parser.add_argument("--model-size", default=get_default(config, "training", "model_size", fallback="n"),
                         choices=["n", "s", "m", "l", "x"])
-    parser.add_argument("--epochs", type=int, default=20)
+    parser.add_argument("--epochs", type=int, default=100)
     parser.add_argument("--batch", type=int, default=get_default(config, "training", "batch", fallback=8))
     parser.add_argument("--imgsz", type=int, default=get_default(config, "training", "imgsz", fallback=640))
     parser.add_argument("--device", default=DEVICE)
     parser.add_argument("--yolo-version",  default=get_default(config, "training", "yolo_version", fallback="11"),
                         choices=["8", "11"])
-    parser.add_argument("--lr", type=float, default=1e-4)
+    parser.add_argument("--lr", type=float, default=1e-5)
     parser.add_argument("--tracknet-img-size", type=int, default=256)
     parser.add_argument("--patience", type=int, default=15)
     parser.add_argument("--lr-patience", type=int, default=5)

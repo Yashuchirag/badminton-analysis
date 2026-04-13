@@ -93,7 +93,7 @@ class TrackNetV2(nn.Module):
         d2 = self.dec2(torch.cat([self.up2(d3), e2], dim=1))
         d1 = self.dec1(torch.cat([self.up1(d2), e1], dim=1))
 
-        return torch.sigmoid(self.output_conv(d1)).squeeze(1)
+        return self.output_conv(d1).squeeze(1)
 
 
 class TrackNetV2Trainer:
@@ -102,7 +102,7 @@ class TrackNetV2Trainer:
         split_dir: str,
         output_dir: str,
         sequence_length: int = 3,
-        img_size: int = 512,
+        img_size: int = 256,
         epochs: int = 20,
         batch_size: int = 16,
         lr: float = 1e-4,
@@ -130,17 +130,32 @@ class TrackNetV2Trainer:
         val_ds = TrackNetDataset(split_dir, "val",   sequence_length, img_size)
         use_pin = device != "cpu"
 
-        train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True,
-                                  num_workers=8, pin_memory=use_pin)
-        val_loader = DataLoader(val_ds,   batch_size=batch_size, shuffle=False,
-                                  num_workers=8, pin_memory=use_pin)
+        train_loader = DataLoader(
+            train_ds, batch_size=batch_size, shuffle=True,
+            num_workers=8, pin_memory=use_pin, persistent_workers=True
+        )
+        val_loader = DataLoader(
+            val_ds, batch_size=batch_size, shuffle=False,
+            num_workers=8, pin_memory=use_pin, persistent_workers=True
+        )
 
         model = TrackNetV2(sequence_length).to(device)
         optimizer = optim.Adam(model.parameters(), lr=lr)
-        criterion = nn.BCELoss()
+        def weighted_bce(pred, target, pos_weight=10.0):
+            pw = torch.tensor([pos_weight], device=pred.device)
+            return nn.functional.binary_cross_entropy_with_logits(
+                pred, target, pos_weight=pw
+            )
+
+        criterion = weighted_bce
+
         scheduler = optim.lr_scheduler.ReduceLROnPlateau(
             optimizer, mode="min", factor=0.5, patience=lr_patience
         )
+
+        use_amp = (device != "cpu")
+        scaler_device = "cuda" if use_amp else "cpu"
+        scaler = torch.amp.GradScaler(scaler_device, enabled=use_amp)
 
         start_epoch = 0
         best_val_loss = float("inf")
@@ -154,9 +169,11 @@ class TrackNetV2Trainer:
             optimizer.load_state_dict(ckpt["optimizer_state_dict"])
             start_epoch = ckpt.get("epoch", 0) + 1
             best_val_loss = ckpt.get("val_loss", float("inf"))
-            prev_lr = optimizer.param_groups[0]["lr"]
+            for pg in optimizer.param_groups:
+                pg["lr"] = lr
+            prev_lr = lr
             training_mode = "RESUME"
-            print(f"Resuming from epoch {start_epoch}")
+            print(f"Resuming from epoch {start_epoch} | LR set to {lr:.2e}")
 
         elif finetune_from:
             TrackNetV2Trainer._load_weights_flexible(model, finetune_from, device)
@@ -180,6 +197,9 @@ class TrackNetV2Trainer:
         print("Training TrackNetV2")
         print(f"  Mode            : {training_mode}")
         print(f"  Device          : {device}")
+        print(f"  Mixed precision : {'enabled' if use_amp else 'disabled (CPU)'}")
+        print(f"  Image size      : {img_size}x{img_size}")
+        print(f"  Batch size      : {batch_size}")
         print(f"  Train sequences : {len(train_ds)}")
         print(f"  Val sequences   : {len(val_ds)}")
         print(f"  Max epochs      : {epochs}  (early stop: {patience})")
@@ -211,14 +231,19 @@ class TrackNetV2Trainer:
                 images = images.to(device)
                 heatmaps = heatmaps.to(device)
                 optimizer.zero_grad()
-                loss = criterion(model(images), heatmaps)
-                loss.backward()
-                optimizer.step()
-                train_loss += loss.item()
 
+                with torch.autocast(device_type="cuda" if use_amp else "cpu",
+                                    enabled=use_amp):
+                    loss = criterion(model(images), heatmaps)
+
+                scaler.scale(loss).backward()
+                scaler.step(optimizer)
+                scaler.update()
+
+                train_loss += loss.item()
                 train_bar.set_postfix(
                     loss=f"{train_loss / (batch_idx+1):.6f}",
-                    refresh=True
+                    refresh=False
                 )
             
             train_bar.close()
@@ -231,7 +256,7 @@ class TrackNetV2Trainer:
 
             val_bar = tqdm(
                 val_loader,
-                desc=f"Epoch {epoch+1}/{total_epochs}",
+                desc=f"  Val  {epoch+1}/{total_epochs}",
                 unit="batch",
                 leave=False,
                 dynamic_ncols=True,
@@ -239,13 +264,17 @@ class TrackNetV2Trainer:
             )
 
             with torch.no_grad():
-                for images, heatmaps in val_loader:
+                for images, heatmaps in val_bar:
                     images = images.to(device)
                     heatmaps = heatmaps.to(device)
-                    outputs = model(images)
-                    val_loss += criterion(outputs, heatmaps).item()
 
-                    for pred, gt in zip(outputs.cpu().numpy(), heatmaps.cpu().numpy()):
+                    with torch.autocast(device_type="cuda" if use_amp else "cpu",
+                                    enabled=use_amp):
+                        outputs = model(images)
+                    val_loss += criterion(outputs, heatmaps).item()
+                    outputs_prob = torch.sigmoid(outputs)
+
+                    for pred, gt in zip(outputs_prob.cpu().numpy(), heatmaps.cpu().numpy()):
                         if gt.max() > 0.5:
                             py, px = np.unravel_index(pred.argmax(), pred.shape)
                             gy, gx = np.unravel_index(gt.argmax(),   gt.shape)
@@ -255,7 +284,7 @@ class TrackNetV2Trainer:
 
                     val_bar.set_postfix(
                         loss=f"{val_loss / (val_bar.n or 1):.6f}",
-                        refresh=True
+                        refresh=False
                     )
             
             val_bar.close()
@@ -266,7 +295,7 @@ class TrackNetV2Trainer:
             scheduler.step(val_loss)
             current_lr = optimizer.param_groups[0]["lr"]
             if current_lr != prev_lr:
-                print(f"LR changed from {prev_lr:.2e} to {current_lr:.2e}")
+                tqdm.write(f"   LR changed from {prev_lr:.2e} to {current_lr:.2e}")
                 prev_lr = current_lr
 
             # Epoch bar
@@ -276,7 +305,7 @@ class TrackNetV2Trainer:
                 accuracy=f"{accuracy:.1f}%",
                 lr=f"{current_lr:.2e}",
                 best_val_loss=f"{best_val_loss:.6f}",
-                refresh=True
+                refresh=False
             )
 
             tqdm.write(
@@ -288,11 +317,11 @@ class TrackNetV2Trainer:
             # Checkpoint
             torch.save({
                 "epoch": epoch,
-                "model_state_dict":model.state_dict(),
+                "model_state_dict": model.state_dict(),
                 "optimizer_state_dict": optimizer.state_dict(),
                 "train_loss": train_loss,
-                "val_loss":val_loss,
-                "accuracy":accuracy,
+                "val_loss": val_loss,
+                "accuracy": accuracy,
             }, os.path.join(save_dir, f"tracknetv2_epoch_{epoch+1}.pth"))
 
             if val_loss < best_val_loss:
@@ -320,10 +349,6 @@ class TrackNetV2Trainer:
 
     @staticmethod
     def _load_weights_flexible(model: nn.Module, weights_path: str, device: str):
-        """
-        Load weights with automatic remapping from old TrackNet → TrackNetV2.
-        Falls back to partial loading if shapes don't match.
-        """
         ckpt = torch.load(weights_path, map_location=device)
         old_state = ckpt.get("model_state_dict", ckpt)
         new_state = model.state_dict()
@@ -349,12 +374,14 @@ class TrackNetV2Trainer:
         skipped = len(new_state) - len(transferred)
         print(f"  ✓ Loaded {len(transferred)} layers | "
               f"⚠ {skipped} layers initialised from scratch")
+    
+
 
 class TrackNetDataset(Dataset):
     """Dataset for TrackNetV2. Compatible with both your format and TrackNetV2 format."""
 
     def __init__(self, split_dir: str, split: str = "train",
-                 sequence_length: int = 3, img_size: int = 512):
+                 sequence_length: int = 3, img_size: int = 256):
         self.img_dir = Path(split_dir) / split / "images"
         self.ann_path = Path(split_dir) / split / "annotations.json"
         self.sequence_length = sequence_length
@@ -374,6 +401,48 @@ class TrackNetDataset(Dataset):
 
         print(f"TrackNet {split}: {len(self.valid_indices)} sequences "
               f"(from {len(self.frames)} frames)")
+
+        print(f"  Pre-loading images into RAM [{split}]...")
+        self.image_cache = {}
+        self.orig_dims   = {}
+
+        needed_frames = set(
+            self.frames[self.valid_indices[i] + j]
+            for i in range(len(self.valid_indices))
+            for j in range(self.sequence_length)
+        )
+
+        for fname in tqdm(needed_frames, desc=f"  [{split}] images",
+                        leave=False, dynamic_ncols=True):
+            img = cv2.imread(str(self.img_dir / fname))
+            if img is None:
+                img = np.zeros((img_size, img_size, 3), dtype=np.uint8)
+                self.orig_dims[fname] = (img_size, img_size)
+            else:
+                self.orig_dims[fname] = (img.shape[0], img.shape[1])
+            img = cv2.resize(img, (img_size, img_size))
+            img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+            self.image_cache[fname] = img
+
+        # ── Pre-compute heatmaps SECOND — use image_cache for dimensions ───
+        print(f"  Pre-computing heatmaps [{split}]...")
+        self.heatmap_cache = {}
+        sigma  = 5
+        yy, xx = np.mgrid[0:img_size, 0:img_size]
+
+        for fname in tqdm(needed_frames, desc=f"  [{split}] heatmaps",
+                  leave=False, dynamic_ncols=True):
+            ann = self.annotations[fname]
+            if ann.get("visibility") == "visible" and ann.get("x") is not None:
+                # Read original dimensions from disk only — lightweight header read
+                h_orig, w_orig = self.orig_dims[fname]
+                x = max(0, min(int(float(ann["x"]) * img_size / w_orig), img_size - 1))
+                y = max(0, min(int(float(ann["y"]) * img_size / h_orig), img_size - 1))
+                heatmap = np.exp(-((xx - x) ** 2 + (yy - y) ** 2) / (2 * sigma ** 2))
+                self.heatmap_cache[fname] = heatmap.astype(np.float32)
+            else:
+                self.heatmap_cache[fname] = np.zeros((img_size, img_size), np.float32)
+        
 
     def _get_prefix_and_num(self, fname: str):
         import re
@@ -397,31 +466,14 @@ class TrackNetDataset(Dataset):
         return len(self.valid_indices)
 
     def __getitem__(self, idx):
-        start      = self.valid_indices[idx]
+        start = self.valid_indices[idx]
         seq_frames = self.frames[start:start + self.sequence_length]
 
         images = []
         for fname in seq_frames:
-            img = cv2.imread(str(self.img_dir / fname))
-            if img is None:
-                img = np.zeros((self.img_size, self.img_size, 3), dtype=np.uint8)
-            img = cv2.resize(img, (self.img_size, self.img_size))
-            img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-            images.append(img)
-
-        images = np.array(images).transpose(0, 3, 1, 2).astype(np.float32) / 255.0
-
-        last_ann = self.annotations[seq_frames[-1]]
-        heatmap  = np.zeros((self.img_size, self.img_size), dtype=np.float32)
-
-        if last_ann.get("visibility") == "visible" and last_ann.get("x") is not None:
-            orig = cv2.imread(str(self.img_dir / seq_frames[-1]))
-            if orig is not None:
-                h_orig, w_orig = orig.shape[:2]
-                x = max(0, min(int(float(last_ann["x"]) * self.img_size / w_orig), self.img_size - 1))
-                y = max(0, min(int(float(last_ann["y"]) * self.img_size / h_orig), self.img_size - 1))
-                sigma  = 5
-                yy, xx = np.mgrid[0:self.img_size, 0:self.img_size]
-                heatmap = np.exp(-((xx - x) ** 2 + (yy - y) ** 2) / (2 * sigma ** 2)).astype(np.float32)
-
+            images.append(self.image_cache[fname])
+ 
+        images  = np.array(images).transpose(0, 3, 1, 2).astype(np.float32) / 255.0
+        heatmap = self.heatmap_cache[seq_frames[-1]]
+ 
         return torch.FloatTensor(images), torch.FloatTensor(heatmap)
