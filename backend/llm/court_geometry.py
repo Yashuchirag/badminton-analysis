@@ -16,8 +16,9 @@ ZONES = {
     "service_far":    [(0,    -2.59), (6.7, -2.59), (6.7, 2.59),  (0,   2.59)],
 }
 
-# Margin within which we escalate to Gemma4 (metres)
-LINE_MARGIN = 0.05   # 5cm
+# Margin within which we escalate to Gemma4 (metres).
+# Tracking has ~5-10px error which maps to ~10cm on court; 15cm gives safe headroom.
+LINE_MARGIN = 0.15   # 15cm
 
 
 class CourtHomography:
@@ -36,11 +37,12 @@ class CourtHomography:
 
 
 def point_in_polygon(x: float, y: float, polygon: list) -> bool:
-    pts = np.array(polygon, dtype=np.float32)
-    result = cv2.pointPolygonTest(pts, (x, y), measureDist=False)
+    pts = np.array(polygon, dtype=np.float32).reshape((-1, 1, 2))
+    result = cv2.pointPolygonTest(pts, (float(x), float(y)), measureDist=False)
     return result >= 0
 
 def distance_to_boundary(x: float, y: float, polygon: list) -> float:
-    """Returns signed distance; negative = outside."""
-    pts = np.array(polygon, dtype=np.float32)
-    return cv2.pointPolygonTest(pts, (x, y), measureDist=True)
+    """Returns signed distance (metres); positive = inside, negative = outside."""
+    # OpenCV pointPolygonTest requires contour shape (N, 1, 2)
+    pts = np.array(polygon, dtype=np.float32).reshape((-1, 1, 2))
+    return cv2.pointPolygonTest(pts, (float(x), float(y)), measureDist=True)

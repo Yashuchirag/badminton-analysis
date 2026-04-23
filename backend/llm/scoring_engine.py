@@ -1,9 +1,10 @@
 import numpy as np
+import cv2
 from dataclasses import dataclass, field
 from typing import Optional
 from enum import Enum
 import sys, os
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..")) 
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from court_geometry import CourtHomography, ZONES, LINE_MARGIN, distance_to_boundary
 from model2.train_and_track import ShuttleTracker
@@ -77,10 +78,15 @@ class ScoringEngine:
 
         self.court = CourtHomography()
         self.landing = LandingDetector()
+        self._H_inv: Optional[np.ndarray] = None
 
     def calibrate(self, pixel_pts: list, court_pts: list):
-        import numpy as np
         self.court.calibrate(np.array(pixel_pts), np.array(court_pts))
+        # Also store the inverse homography so we can project court → pixel
+        if self.court.H is not None:
+            self._H_inv = np.linalg.inv(self.court.H)
+        else:
+            self._H_inv = None
 
     def process_frame(
             self,
@@ -128,8 +134,9 @@ class ScoringEngine:
         else:
             # Near line — block and wait for Gemma4 (intentional, keeps score in sync)
             if self.gemma:
+                annotated = self._draw_court_overlay(frame.copy(), cx, cy, det.x, det.y)
                 result = self.gemma.judge(
-                    frame, cx, cy,
+                    annotated, cx, cy,
                     zone_name=f"{self.game_mode} court",
                     distance_to_line=dist,
                 )
@@ -150,6 +157,41 @@ class ScoringEngine:
 
         self.state.history.append(event)
         return event
+
+    def _draw_court_overlay(
+            self, frame: np.ndarray,
+            court_x: float, court_y: float,
+            px: float, py: float,
+        ) -> np.ndarray:
+        """
+        Project the court boundary polygon back into pixel space and draw it
+        on a copy of the frame, plus mark the shuttle landing position.
+        This gives Gemma a visual reference for where the court lines are.
+        """
+        if self._H_inv is None:
+            return frame
+
+        # Project zone polygon corners court → pixel
+        corners = np.array(self._zone_poly, dtype=np.float32).reshape((-1, 1, 2))
+        pix_corners = cv2.perspectiveTransform(corners, self._H_inv)
+        pix_corners = pix_corners.reshape((-1, 2)).astype(np.int32)
+
+        # Draw court boundary in cyan
+        cv2.polylines(frame, [pix_corners], isClosed=True,
+                      color=(255, 255, 0), thickness=2)
+
+        # Mark shuttle landing position with a bright circle + crosshair
+        ipx, ipy = int(round(px)), int(round(py))
+        cv2.circle(frame, (ipx, ipy), 8,  (0, 0, 255), 2)
+        cv2.line(frame, (ipx - 12, ipy), (ipx + 12, ipy), (0, 0, 255), 1)
+        cv2.line(frame, (ipx, ipy - 12), (ipx, ipy + 12), (0, 0, 255), 1)
+
+        # Label with court coordinates
+        label = f"({court_x:.2f}m, {court_y:.2f}m)"
+        cv2.putText(frame, label, (ipx + 10, ipy - 10),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
+
+        return frame
 
     def _update_score(self, event: LandingEvent):
         last_hitter = self.state.last_hitter

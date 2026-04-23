@@ -16,9 +16,31 @@ engine = ScoringEngine(
     device="0",
 )
 
+# ── Court homography calibration ─────────────────────────────────────────────
+# IMPORTANT: pixel_pts must match the actual court corners in YOUR video.
+# Run caliberate_ui.py first to click the four corners interactively:
+#
+#   conda activate ubenv
+#   python backend/llm/caliberate_ui.py
+#
+# It will print the exact pixel_pts to paste here.
+# Corners must be clicked in order: Top-Left → Top-Right → Bottom-Right → Bottom-Left
+#
+_DEFAULT_PIXEL_PTS = [[120, 80], [560, 80], [560, 420], [120, 420]]
+_pixel_pts = _DEFAULT_PIXEL_PTS  # <-- replace after running caliberate_ui.py
+
+if _pixel_pts == _DEFAULT_PIXEL_PTS:
+    import warnings
+    warnings.warn(
+        "\n\n⚠  Using PLACEHOLDER calibration points — court detection will be wrong!\n"
+        "   Run:  python backend/llm/caliberate_ui.py\n"
+        "   and paste the printed pixel_pts here before running.\n",
+        stacklevel=2,
+    )
+
 engine.calibrate(
-    pixel_pts=[[120, 80], [560, 80], [560, 420], [120, 420]],
-    court_pts=[[-6.7, -2.59], [6.7, -2.59], [6.7, 2.59], [-6.7, 2.59]],
+    pixel_pts=_pixel_pts,
+    court_pts=[[6.7, 2.59], [6.7, -2.59], [-6.7, -2.59], [-6.7, 2.59]],
 )
 
 cap = cv2.VideoCapture("model2/dataset/videos/match3/video/2_18_15.mp4")
