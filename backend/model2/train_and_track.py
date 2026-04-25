@@ -1,4 +1,5 @@
 import os
+import sys
 import yaml
 import json
 import cv2
@@ -8,6 +9,11 @@ from pathlib import Path
 from collections import deque
 from typing import Optional
 from queue import Queue, Empty
+
+# Ensure model2/ is on sys.path so sibling modules (TrackNetV2.py) are found
+# regardless of which directory this file is imported from.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
 from TrackNetV2 import TrackNetV2, TrackNetDataset, TrackNetV2Trainer
 
 try:
@@ -394,26 +400,104 @@ class ShuttleTracker:
             print(f"✓ Loaded YOLO-OBB: {obb_weights}")
         
         if tracknet_weights and TORCH_AVAILABLE:
-            checkpoint = torch.load(tracknet_weights, map_location=self.device)
+            checkpoint = torch.load(tracknet_weights, map_location=self.device,
+                                    weights_only=False)
             self.tracknet_model = TrackNetV2(sequence_length=3).to(self.device)
             self.tracknet_model.load_state_dict(checkpoint['model_state_dict'])
             self.tracknet_model.eval()
-            
+
             if use_cuda and self.use_fp16:
                 self.tracknet_model.half()
 
-            # torch.compile gives 10-30% speedup on PyTorch 2.0+
-            if use_compile and hasattr(torch, "compile"):
-                try:
-                    self.tracknet_model = torch.compile(self.tracknet_model)
-                    print("✓ torch.compile applied to TrackNet")
-                except Exception as e:
-                    print(f"⚠ torch.compile skipped: {e}")
+            # torch.compile is disabled: Triton's ptxas subprocess fails when the
+            # install path contains spaces (e.g. WSL mount /mnt/d/Personal Projects/…).
+            # The eager path is fast enough for real-time inference on GPU.
+            # Uncomment the block below only if your install path has no spaces.
+            # if use_compile and hasattr(torch, "compile"):
+            #     try:
+            #         self.tracknet_model = torch.compile(self.tracknet_model)
+            #         print("✓ torch.compile applied to TrackNet")
+            #     except Exception as e:
+            #         print(f"⚠ torch.compile skipped: {e}")
 
             print(f"✓ Loaded TrackNet: {tracknet_weights}")
         
         self.frame_buffer = deque(maxlen=3)  # For TrackNet multi-frame input
-    
+
+    def predict_frame(
+            self,
+            frame: np.ndarray,
+            mode: str = "hybrid",
+            conf_threshold: float = 0.25,
+            yolo_conf_skip_tracknet: float = 0.65,
+    ) -> tuple:
+        """
+        Run inference on a single frame.
+
+        Returns:
+            (pos, conf, source)
+            pos    – (x, y) pixel coordinates or None if not detected
+            conf   – detection confidence 0.0–1.0
+            source – "obb" | "yolo" | "tracknet" | "hybrid" | "none"
+        """
+        h, w = frame.shape[:2]
+        use_half = "cuda" in self.device and self.use_fp16
+
+        infer = cv2.resize(frame, (INFERENCE_SIZE, INFERENCE_SIZE))
+        sx = w / INFERENCE_SIZE
+        sy = h / INFERENCE_SIZE
+
+        def _scale(pos):
+            return (pos[0] * sx, pos[1] * sy) if pos is not None else None
+
+        # ── YOLO-only ────────────────────────────────────────────────────
+        if mode == "yolo" and self.yolo_model is not None:
+            r = self.yolo_model([infer], conf=conf_threshold,
+                                verbose=False, half=use_half)[0]
+            pos, conf = self._extract_box_with_conf(r, is_obb=False)
+            return _scale(pos), float(conf), "yolo"
+
+        # ── OBB-only ─────────────────────────────────────────────────────
+        if mode == "obb" and self.obb_model is not None:
+            r = self.obb_model([infer], conf=conf_threshold,
+                               verbose=False, half=use_half)[0]
+            pos, conf = self._extract_box_with_conf(r, is_obb=True)
+            return _scale(pos), float(conf), "obb"
+
+        # ── TrackNet-only ─────────────────────────────────────────────────
+        if mode == "tracknet" and self.tracknet_model is not None:
+            pos = self._detect_tracknet(frame, w, h)
+            return pos, (0.7 if pos is not None else 0.0), "tracknet"
+
+        # ── Hybrid: YOLO/OBB first, TrackNet as low-confidence fallback ──
+        model   = self.obb_model if self.obb_model is not None else self.yolo_model
+        is_obb  = self.obb_model is not None
+        src_det = "obb" if is_obb else "yolo"
+
+        yolo_pos, yolo_conf = None, 0.0
+        if model is not None:
+            r = model([infer], conf=conf_threshold,
+                      verbose=False, half=use_half)[0]
+            yolo_pos, yolo_conf = self._extract_box_with_conf(r, is_obb=is_obb)
+            yolo_pos = _scale(yolo_pos)
+
+        # High-confidence YOLO hit — skip TrackNet entirely
+        if yolo_conf >= yolo_conf_skip_tracknet or self.tracknet_model is None:
+            return yolo_pos, float(yolo_conf), src_det
+
+        tracknet_pos = self._detect_tracknet(frame, w, h)
+
+        if yolo_pos and tracknet_pos:
+            dist = np.hypot(yolo_pos[0] - tracknet_pos[0],
+                            yolo_pos[1] - tracknet_pos[1])
+            pos = tracknet_pos if dist < 50 else yolo_pos
+            return pos, float(yolo_conf), "hybrid"
+
+        pos = yolo_pos or tracknet_pos
+        conf = float(yolo_conf) if yolo_pos else (0.7 if tracknet_pos else 0.0)
+        src  = "hybrid" if pos else "none"
+        return pos, conf, src
+
     def track_video(self, video_path: str, output_path: str,
                     mode: str = "hybrid", conf_threshold: float = 0.25,
                     show_trail: bool = True, trail_length: int = 30, batch_size: int = 8,

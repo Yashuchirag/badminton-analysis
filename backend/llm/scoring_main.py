@@ -5,6 +5,9 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from gemma_client import LineJudge
 from scoring_engine import ScoringEngine
 
+# ── Video to process ──────────────────────────────────────────────────────────
+VIDEO_PATH = "model2/dataset/TrackNetV2_Dataset/Professional/match3/video/2_18_15.mp4"
+
 judge = LineJudge(model="gemma4:e4b")
 
 engine = ScoringEngine(
@@ -16,36 +19,18 @@ engine = ScoringEngine(
     device="0",
 )
 
-# ── Court homography calibration ─────────────────────────────────────────────
-# IMPORTANT: pixel_pts must match the actual court corners in YOUR video.
-# Run caliberate_ui.py first to click the four corners interactively:
-#
-#   conda activate ubenv
-#   python backend/llm/caliberate_ui.py
-#
-# It will print the exact pixel_pts to paste here.
-# Corners must be clicked in order: Top-Left → Top-Right → Bottom-Right → Bottom-Left
-#
-_DEFAULT_PIXEL_PTS = [[120, 80], [560, 80], [560, 420], [120, 420]]
-_pixel_pts = _DEFAULT_PIXEL_PTS  # <-- replace after running caliberate_ui.py
+# ── Auto-detect court corners from the video — no manual calibration needed ──
+print("Auto-detecting court lines…")
+try:
+    engine.auto_calibrate(VIDEO_PATH)
+except RuntimeError as e:
+    print(f"\n❌ Court auto-calibration failed:\n  {e}")
+    print("   Check that the video shows clear court lines.")
+    sys.exit(1)
 
-if _pixel_pts == _DEFAULT_PIXEL_PTS:
-    import warnings
-    warnings.warn(
-        "\n\n⚠  Using PLACEHOLDER calibration points — court detection will be wrong!\n"
-        "   Run:  python backend/llm/caliberate_ui.py\n"
-        "   and paste the printed pixel_pts here before running.\n",
-        stacklevel=2,
-    )
+cap = cv2.VideoCapture(VIDEO_PATH)
 
-engine.calibrate(
-    pixel_pts=_pixel_pts,
-    court_pts=[[6.7, 2.59], [6.7, -2.59], [-6.7, -2.59], [-6.7, 2.59]],
-)
-
-cap = cv2.VideoCapture("model2/dataset/videos/match3/video/2_18_15.mp4")
-
-# ── Video writer setup ────────────────────────────────────────────────────
+# ── Video writer setup ────────────────────────────────────────────────────────
 fps    = int(cap.get(cv2.CAP_PROP_FPS))
 width  = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
 height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
@@ -63,37 +48,33 @@ try:
         landing = engine.process_frame(frame, frame_idx)
         score   = engine.state.score
 
+        # ── Court boundary overlay ────────────────────────────────────────
+        engine.draw_court_boundaries(frame)
+
         # ── Score overlay ─────────────────────────────────────────────────
-        # Black bar at top for readability
         cv2.rectangle(frame, (0, 0), (width, 70), (0, 0, 0), -1)
 
-        # Player labels + score
         cv2.putText(frame, "P1", (20, 45),
                     cv2.FONT_HERSHEY_DUPLEX, 1.2, (255, 255, 255), 2)
         cv2.putText(frame, str(score[0]), (75, 45),
                     cv2.FONT_HERSHEY_DUPLEX, 1.4, (0, 255, 100), 2)
-
         cv2.putText(frame, "-", (120, 45),
                     cv2.FONT_HERSHEY_DUPLEX, 1.2, (200, 200, 200), 2)
-
         cv2.putText(frame, str(score[1]), (145, 45),
                     cv2.FONT_HERSHEY_DUPLEX, 1.4, (0, 255, 100), 2)
         cv2.putText(frame, "P2", (195, 45),
                     cv2.FONT_HERSHEY_DUPLEX, 1.2, (255, 255, 255), 2)
 
-        # Game number
         cv2.putText(frame, f"Game {engine.state.game}", (width - 160, 45),
                     cv2.FONT_HERSHEY_DUPLEX, 1.0, (200, 200, 200), 2)
 
-        # Serving indicator (small dot under server's score)
         serving = engine.state.serving_side
         serve_x = 85 if serving == 0 else 150
         cv2.circle(frame, (serve_x, 58), 5, (0, 255, 255), -1)
 
-        # Landing verdict banner (shown for ~1 second = fps frames)
         if landing:
-            color   = (0, 220, 0) if landing.verdict.value == "IN" else (0, 0, 220)
-            label   = f"  {landing.verdict.value}  {landing.reason[:60]}"
+            color = (0, 220, 0) if landing.verdict.value == "IN" else (0, 0, 220)
+            label = f"  {landing.verdict.value}  {landing.reason[:60]}"
             cv2.rectangle(frame, (0, height - 50), (width, height), (0, 0, 0), -1)
             cv2.putText(frame, label, (10, height - 15),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.65, color, 2)
