@@ -1,17 +1,3 @@
-"""
-CLI entry point for the court-mapping pipeline.
-
-Usage
------
-    cd backend
-    python -m court_mapping.run --input path/to/video.mp4
-    python -m court_mapping.run --input video.mp4 --output marked.mp4 --debug
-
-The default output goes to backend/court_mapping/output/<input_stem>_marked.mp4.
-With --debug, additional intermediate artefacts are written next to the video
-(median frame, court mask, single-still detection viz, JSON of corners).
-"""
-
 from __future__ import annotations
 
 import argparse

@@ -1,11 +1,3 @@
-"""
-Geometric utilities: corner ordering, mask-to-quadrilateral, validation,
-and projection of canonical court lines back into the image.
-
-Reuses constants and the homography helper from llm.court_geometry without
-modifying that file.
-"""
-
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -21,12 +13,6 @@ from llm.court_geometry import COURT, CourtHomography
 # ─── Corner ordering ────────────────────────────────────────────────────────
 
 def order_corners(pts: np.ndarray) -> np.ndarray:
-    """
-    Order 4 points as: Top-Left, Top-Right, Bottom-Right, Bottom-Left.
-
-    Same convention as llm.court_geometry._order_corners — duplicated here so
-    this module is self-contained and not coupled to a private helper.
-    """
     pts = np.asarray(pts, dtype=np.float32).reshape(4, 2)
     s = pts.sum(axis=1)
     d = pts[:, 1] - pts[:, 0]   # y - x
@@ -41,18 +27,7 @@ def order_corners(pts: np.ndarray) -> np.ndarray:
 # ─── Mask → quadrilateral ───────────────────────────────────────────────────
 
 def mask_to_quadrilateral(mask: np.ndarray) -> Optional[np.ndarray]:
-    """
-    Approximate the largest contour of the mask as a 4-point quadrilateral.
-
-    Tries multiple polygon-approximation tolerances (epsilon as a fraction of
-    contour perimeter). Falls back to a sum/diff selection over the convex
-    hull if approxPolyDP doesn't yield exactly 4 points.
-
-    Returns
-    -------
-    np.ndarray | None
-        (4, 2) float32 array ordered TL/TR/BR/BL, or None on failure.
-    """
+    
     if mask is None or mask.size == 0:
         return None
 
@@ -105,20 +80,7 @@ def validate_corners(
     min_area_ratio: float = 0.05,
     max_area_ratio: float = 0.97,
 ) -> ValidationReport:
-    """
-    Sanity-check a quadrilateral as a plausible badminton court boundary.
-
-    Parameters
-    ----------
-    corners : np.ndarray
-        (4, 2) ordered TL/TR/BR/BL.
-    image_shape : (h, w)
-    margin_ratio : float
-        Allowable corner overshoot beyond image bounds (fraction of width/height).
-    min_area_ratio, max_area_ratio : float
-        Quad area / image area must lie within [min, max]. Lower bound rejects
-        tiny mis-detections; upper bound rejects "the entire frame" detections.
-    """
+    
     reasons: List[str] = []
     h, w = image_shape
 
@@ -161,16 +123,7 @@ def fit_homography(
     pixel_corners: np.ndarray,
     mode: str = "doubles",
 ) -> Optional[CourtHomography]:
-    """
-    Fit a homography from 4 ordered pixel corners (TL/TR/BR/BL) to the
-    canonical court rectangle for the given mode.
-
-    Note on point ordering
-    ----------------------
-    llm.court_geometry._COURT_PTS lists points in a different rotation than
-    our TL/TR/BR/BL convention. We re-derive the canonical mapping here from
-    the COURT length/width to avoid coupling with that ordering.
-    """
+    
     spec = COURT.get(mode) or COURT["doubles"]
     half_len = spec["length"] / 2.0   # x extent (court length runs along x in metres)
     half_wid = spec["width"] / 2.0    # y extent
@@ -205,22 +158,7 @@ class CourtLine:
 
 
 def canonical_court_lines(mode: str = "doubles") -> List[CourtLine]:
-    """
-    Return the set of canonical badminton court lines in court-space metres.
-
-    Origin: court centre (where the net crosses the centre line).
-    x axis: along the long dimension (length, ±6.7 m).
-    y axis: across the court (width).
-
-    All BWF reference dimensions:
-      - Court length: 13.40 m → ±6.70 m
-      - Doubles width: 6.10 m → ±3.05 m
-      - Singles width: 5.18 m → ±2.59 m
-      - Short service line: 1.98 m from net → x = ±1.98
-      - Long service line (doubles): 0.76 m in from baseline → x = ±5.94
-      - Net: x = 0
-      - Centre service line: y = 0, between short service lines
-    """
+    
     half_len = 6.70
     doubles_half = 3.05
     singles_half = 2.59
@@ -279,14 +217,7 @@ def project_court_lines(
     homography: CourtHomography,
     mode: str = "doubles",
 ) -> List[Tuple[CourtLine, Tuple[Tuple[int, int], Tuple[int, int]]]]:
-    """
-    Project all canonical court lines from court space → pixel space using the
-    inverse of the homography that takes pixel→court.
-
-    Returns
-    -------
-    list of (CourtLine, ((px1, py1), (px2, py2)))
-    """
+    
     if homography.H_inv is None:
         raise RuntimeError("Homography not calibrated (H_inv is None)")
 

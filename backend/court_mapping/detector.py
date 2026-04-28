@@ -1,20 +1,3 @@
-"""
-End-to-end orchestrator: video file → detected court corners + homography.
-
-Pipeline:
-    1. Compute temporal-median frame from the video (removes players/shuttle).
-    2. Segment the court surface from the median frame (HSV mask).
-    3. Approximate the largest mask blob as a 4-point quadrilateral.
-    4. Refine each corner sub-pixel using LSD line fitting along corridors.
-    5. Validate the resulting quad (convexity, area, in-bounds).
-    6. Fit a homography from the refined corners to the canonical court.
-    7. Project all canonical court lines back into image space.
-
-The output is a CourtDetectionResult bundling the detected geometry, the
-projected line set ready for drawing, and (optionally) intermediate artefacts
-for debugging.
-"""
-
 from __future__ import annotations
 
 from dataclasses import dataclass, field
@@ -39,7 +22,6 @@ from .temporal import MedianResult, VideoInfo, compute_median_frame
 
 @dataclass
 class CourtDetectionResult:
-    """Full output of the detector."""
     success: bool
     confidence: str                        # "high" | "medium" | "low" | "failed"
     rough_corners: Optional[np.ndarray]     # (4, 2) before line refinement
@@ -61,30 +43,7 @@ def detect_court_in_video(
     refine: bool = True,
     keep_artifacts: bool = False,
 ) -> CourtDetectionResult:
-    """
-    Run the full pipeline on a video file.
-
-    Parameters
-    ----------
-    video_path : str | Path
-    mode : "doubles" | "singles"
-        Which canonical court width to fit. Default doubles is safest because
-        the doubles outer line is the visible boundary in nearly every video.
-    n_frames : int
-        Frames to sample for the temporal median.
-    refine : bool, default True
-        Whether to run sub-pixel line-refinement after mask quad approximation.
-    keep_artifacts : bool, default False
-        If True, populate `median_frame` and `mask` on the result for caller
-        inspection / debug saving.
-
-    Returns
-    -------
-    CourtDetectionResult
-        With success/confidence flags. Even on partial failure the orchestrator
-        attempts to return whatever it has (e.g. rough corners with no
-        refinement) so downstream visualization can still produce something.
-    """
+    
     notes: List[str] = []
 
     # ── 1. temporal median ───────────────────────────────────────────────

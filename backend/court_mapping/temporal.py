@@ -1,16 +1,3 @@
-"""
-Temporal preprocessing for static-camera badminton videos.
-
-The single biggest leverage point for court detection on a static-camera video
-is to remove moving content (players, shuttle, line judges) before running any
-detection. Per-pixel median across many frames does this cheaply: for any given
-pixel, the court colour is the most common value over time, so the median of a
-representative sample equals the empty-court appearance.
-
-This module produces that "clean court" reference image plus useful video
-metadata for downstream stages.
-"""
-
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -65,29 +52,7 @@ def compute_median_frame(
     n_frames: int = 60,
     max_dim: int | None = None,
 ) -> MedianResult:
-    """
-    Sample ``n_frames`` evenly across the video and compute the per-pixel median.
-
-    On a static-camera video this produces a clean "empty court" reference image
-    by averaging out players and other moving content.
-
-    Parameters
-    ----------
-    video_path : str | Path
-        Path to the input video.
-    n_frames : int, default 60
-        Target number of frames to sample. We hit at most this many frames; if
-        the video has fewer total frames we fall back to whatever's available.
-    max_dim : int | None, default None
-        If set, the median is computed at this max long-edge size for speed.
-        Output is upsampled back to the native frame resolution. Useful for
-        very high-resolution video where the median operation gets expensive.
-
-    Returns
-    -------
-    MedianResult
-        median_frame at native resolution + metadata.
-    """
+    
     info = probe_video(video_path)
 
     if info.total_frames <= 0:

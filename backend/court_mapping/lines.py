@@ -1,24 +1,3 @@
-"""
-Sub-pixel corner refinement using line detection along each side of a rough
-quadrilateral.
-
-The mask-based quadrilateral from segment.py is approximately right but its
-corners are biased inward by the morphological closing step (which fills the
-white painted lines so they don't create gaps in the mask). This module pushes
-the corners back onto the actual painted court lines.
-
-Strategy per side
------------------
-1. Build a corridor mask along the rough side (a fat band, narrow normal).
-2. Run LSD (Line Segment Detector) on the median frame inside that corridor.
-3. RANSAC-fit a single line to the longest, most-aligned segments.
-4. Intersect refined adjacent lines → refined corners.
-
-LSD is built into OpenCV (cv2.createLineSegmentDetector / cv2.ximgproc) and is
-substantially better than Hough at this task because it returns sub-pixel,
-length-aware segments without parameter tuning.
-"""
-
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -53,39 +32,18 @@ _SIDES = [(0, 1), (1, 2), (2, 3), (3, 0)]
 def refine_corners(
     image: np.ndarray,
     rough_corners: np.ndarray,
-    corridor_half_width: int = 25,
-    angle_tol_deg: float = 15.0,
+    corridor_outward_sideline: int = 20,
+    corridor_inward_sideline: int = 90,
+    corridor_outward_baseline: int = 20,
+    corridor_inward_baseline: int = 20,
+    angle_tol_deg: float = 12.0,
     debug: bool = False,
 ) -> RefinementResult:
-    """
-    Refine the 4 court corners by fitting lines to the painted court boundary
-    inside corridors aligned with each rough side.
-
-    Parameters
-    ----------
-    image : np.ndarray
-        BGR frame (typically the temporal median frame).
-    rough_corners : np.ndarray
-        (4, 2) ordered TL/TR/BR/BL — output of mask_to_quadrilateral.
-    corridor_half_width : int
-        Half-width (px) of the corridor perpendicular to each rough side. The
-        true line is expected to lie within this band.
-    angle_tol_deg : float
-        Max angular deviation from the rough side angle for a detected segment
-        to be considered a valid candidate.
-
-    Returns
-    -------
-    RefinementResult
-        Refined corners (or rough corners on failure), per-side success flags,
-        and optional debug artefacts.
-    """
+    
     h, w = image.shape[:2]
-    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
 
-    # Detect all line segments once on the full image — corridor masking
-    # happens at the candidate-filter step rather than re-running LSD.
-    segs = _detect_line_segments(gray)
+    # Detect line segments on white-painted regions only.
+    segs = _detect_line_segments_white(image)
     if segs is None or len(segs) == 0:
         return RefinementResult(
             refined_corners=rough_corners.copy(),
@@ -93,14 +51,40 @@ def refine_corners(
             debug=RefinementDebug([], [[]] * 4, [None] * 4, [False] * 4) if debug else None,
         )
 
+    # Centroid of the rough quad — used to determine which way is "inward"
+    # for each side.
+    centroid = np.mean(rough_corners, axis=0).astype(np.float32)
+
     fitted: List[Tuple[float, float, float]] = []
     side_was_refined: List[bool] = []
     per_side_segments: List[List[Tuple[float, float, float, float]]] = []
     corridor_masks: List[np.ndarray] = []
 
-    for i, j in _SIDES:
+    for side_idx, (i, j) in enumerate(_SIDES):
         p1, p2 = rough_corners[i], rough_corners[j]
-        corridor = _make_corridor_mask((h, w), p1, p2, half_width=corridor_half_width)
+        side_mid = ((p1 + p2) / 2.0).astype(np.float32)
+        # Vector from side midpoint toward the centroid = "inward".
+        inward = centroid - side_mid
+        n_inward = float(np.linalg.norm(inward))
+        inward_dir = inward / n_inward if n_inward > 1e-6 else None
+
+        # Sides 0 and 2 are baselines (top/bottom); 1 and 3 are sidelines
+        # (right/left). Each gets a different inward search depth — see the
+        # docstring for the rationale.
+        is_baseline = side_idx % 2 == 0
+        if is_baseline:
+            outward_extent = corridor_outward_baseline
+            inward_extent = corridor_inward_baseline
+        else:
+            outward_extent = corridor_outward_sideline
+            inward_extent = corridor_inward_sideline
+
+        corridor = _make_corridor_mask(
+            (h, w), p1, p2,
+            outward_extent=outward_extent,
+            inward_extent=inward_extent,
+            inward_dir=inward_dir,
+        )
         if debug:
             corridor_masks.append(corridor)
         candidates = _filter_segments_to_corridor(segs, corridor)
@@ -162,13 +146,43 @@ def refine_corners(
 
 # ─── Line detection ─────────────────────────────────────────────────────────
 
-def _detect_line_segments(gray: np.ndarray) -> List[Tuple[float, float, float, float]]:
+def _detect_line_segments_white(
+    image_bgr: np.ndarray,
+    v_min: int = 160,
+    s_max: int = 70,
+) -> List[Tuple[float, float, float, float]]:
     """
-    Detect line segments using LSD. Falls back to Hough if LSD is unavailable
-    in the OpenCV build (some pip-installed OpenCV variants have it stripped).
+    Detect line segments restricted to WHITE-PAINTED regions.
 
-    Returns a list of (x1, y1, x2, y2) tuples.
+    Court lines are painted white (high V, low S in HSV). By masking the
+    grayscale image to white-only pixels before running LSD we suppress
+    false-positive lines from sponsor banners, scoreboard borders, and the
+    floor's run-off-zone outer contrast edge.
     """
+    if image_bgr is None or image_bgr.size == 0:
+        return []
+    if image_bgr.ndim == 2:
+        gray = image_bgr
+        # Without colour information we can't isolate white; threshold on intensity.
+        white_mask = cv2.inRange(gray, v_min, 255)
+    else:
+        hsv = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2HSV)
+        white_mask = cv2.inRange(hsv, (0, 0, v_min), (180, s_max, 255))
+        gray = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2GRAY)
+
+    # Light morphological close to bridge tiny gaps in the painted line mask.
+    k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+    white_mask = cv2.morphologyEx(white_mask, cv2.MORPH_CLOSE, k)
+
+    # Apply the mask to grayscale: lines stand out as bright pixels on a
+    # uniformly-dark background, which gives LSD very clean input.
+    masked = cv2.bitwise_and(gray, gray, mask=white_mask)
+
+    return _run_line_detector(masked)
+
+
+def _run_line_detector(gray: np.ndarray) -> List[Tuple[float, float, float, float]]:
+    """Try LSD (cv2 / ximgproc) then fall back to Hough."""
     # Try LSD via the main cv2 module.
     try:
         lsd = cv2.createLineSegmentDetector(cv2.LSD_REFINE_STD)
@@ -213,9 +227,19 @@ def _make_corridor_mask(
     shape: Tuple[int, int],
     p1: np.ndarray,
     p2: np.ndarray,
-    half_width: int,
+    outward_extent: int,
+    inward_extent: int,
+    inward_dir: Optional[np.ndarray] = None,
 ) -> np.ndarray:
-    """Render an oriented rectangle mask along the segment p1→p2."""
+    """
+    Render an oriented rectangle mask along the segment p1→p2.
+
+    The corridor is asymmetric in the perpendicular direction:
+    `outward_extent` px on the side AWAY from the court interior, and
+    `inward_extent` px on the side TOWARD the court interior. If
+    `inward_dir` is None the corridor is symmetric (outward = inward
+    perpendicular extent on each side).
+    """
     h, w = shape
     p1 = np.asarray(p1, dtype=np.float32)
     p2 = np.asarray(p2, dtype=np.float32)
@@ -226,16 +250,22 @@ def _make_corridor_mask(
     direction = diff / length
     normal = np.array([-direction[1], direction[0]], dtype=np.float32)
 
+    # Orient `normal` to point INWARD if an inward direction is provided.
+    if inward_dir is not None and float(np.dot(normal, inward_dir)) < 0:
+        normal = -normal
+
     # Extend along axis a bit past the corners so candidate segments that
     # overshoot still register.
     extend = max(int(length * 0.05), 10)
     a = p1 - direction * extend
     b = p2 + direction * extend
+
+    # Build rectangle: +normal direction is INWARD; -normal direction is OUTWARD.
     rect = np.array([
-        a + normal * half_width,
-        b + normal * half_width,
-        b - normal * half_width,
-        a - normal * half_width,
+        a - normal * outward_extent,   # back-outward
+        b - normal * outward_extent,   # forward-outward
+        b + normal * inward_extent,    # forward-inward
+        a + normal * inward_extent,    # back-inward
     ], dtype=np.float32)
 
     mask = np.zeros((h, w), dtype=np.uint8)
@@ -310,13 +340,7 @@ def _ransac_fit_line(
     iterations: int = 200,
     inlier_threshold_px: float = 3.0,
 ) -> Optional[Tuple[float, float, float]]:
-    """
-    Fit a single line to a set of segments, weighted by segment length, using
-    a RANSAC scheme: each trial picks a random segment as a hypothesis line,
-    counts inlier endpoints, then refits via weighted least squares.
-
-    Returns the implicit line (a, b, c) — or None if no good fit.
-    """
+    
     if not segments:
         return None
     if len(segments) == 1:

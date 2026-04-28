@@ -1,10 +1,3 @@
-"""
-Render the detected court grid onto the input video and write a marked MP4.
-
-Since the camera is static, the projected court lines are constant for the
-entire video — we compute them once and overlay the same shape on every frame.
-"""
-
 from __future__ import annotations
 
 from pathlib import Path
@@ -34,13 +27,7 @@ def draw_court_overlay(
     corners: np.ndarray | None = None,
     label_corners: bool = True,
 ) -> np.ndarray:
-    """
-    Draw the court grid onto a single frame and return the annotated frame.
-
-    The drawing is done on a transparent overlay copy and alpha-blended
-    according to per-line-kind style; this keeps the broadcast image visible
-    underneath the lines.
-    """
+    
     annotated = frame.copy()
 
     # Group lines by their alpha so we can blend each group in one step.
@@ -78,10 +65,7 @@ def annotate_video(
     corners: np.ndarray | None = None,
     progress_every: int = 60,
 ) -> int:
-    """
-    Read input_path frame-by-frame, overlay the court grid, write to output_path
-    as an MP4. Returns the number of frames written.
-    """
+    
     input_path = str(input_path)
     output_path = str(output_path)
 

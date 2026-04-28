@@ -1,20 +1,3 @@
-"""
-Court-surface segmentation strategies.
-
-Operates on a clean median frame (no players) so the segmentation step gets a
-huge head-start over single-frame approaches:
-  - colour clusters are stable (no flicker from passing players)
-  - the largest connected region of court colour is uncontested
-  - white-line pixels stay white (median of "white most of the time" is white)
-
-The primary strategy here is HSV-based with adaptive sampling. We pick the hue
-from the central image patch (where the court almost always is on a static
-broadcast or amateur cam), build an inRange mask, mask out brightest white
-(advertising boards), and clean up morphologically.
-
-A SAM-based strategy can be slotted in later as a drop-in replacement.
-"""
-
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -39,34 +22,7 @@ def segment_court_hsv(
     center_patch_ratio: float = 0.25,
     min_area_ratio: float = 0.05,
 ) -> Optional[SegmentationResult]:
-    """
-    Segment the court surface using HSV colour sampling.
-
-    Sampling strategy
-    -----------------
-    Median of the central image patch (default 25% × 25%) gives the dominant
-    court hue. Using the median (not mean) keeps the result stable when a
-    player or scoreboard happens to be at the centre. Saturated white pixels
-    are excluded from sampling so painted lines don't pull the hue.
-
-    Parameters
-    ----------
-    image : np.ndarray
-        BGR uint8 frame (typically the temporal median frame).
-    hue_tolerance : int, default 25
-        Half-width of the hue window in OpenCV's 0..180 hue space.
-    center_patch_ratio : float, default 0.25
-        Fraction of frame edge length used for the sampling patch.
-    min_area_ratio : float, default 0.05
-        Reject the segmentation if the largest connected component is smaller
-        than this fraction of the frame. We expect the court to fill ≥5% of
-        the frame on any sane camera setup.
-
-    Returns
-    -------
-    SegmentationResult | None
-        The cleaned binary mask (largest component only) or None on failure.
-    """
+    
     if image is None or image.size == 0:
         return None
 
