@@ -65,6 +65,7 @@ backend/model2/runs/
 backend/model2/trained_models/
 backend/model2/models/
 backend/model2/output_video
+backend/court_mapping/output/
 
 
 

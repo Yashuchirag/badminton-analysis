@@ -14,11 +14,11 @@ This project aims to bridge **sports + software + AI**, focusing on offline/onli
 
 Badminton scoring is fast-paced and difficult to track manually. This app aims to:
 
-* Accept **video input** (recorded or uploaded)
-* Analyze gameplay using **computer vision models**
-* Automatically **detect shots, rallies, and points**
-* Generate **match scores, statistics, and insights**
-* Serve as a foundation for advanced analytics (player performance, shot types, heatmaps)
+- Accept **video input** (recorded or uploaded)
+- Analyze gameplay using **computer vision models**
+- Automatically **detect shots, rallies, and points**
+- Generate **match scores, statistics, and insights**
+- Serve as a foundation for advanced analytics (player performance, shot types, heatmaps)
 
 ---
 
@@ -26,28 +26,27 @@ Badminton scoring is fast-paced and difficult to track manually. This app aims t
 
 ### 📹 Video Input
 
-* Upload video from device gallery / Record video directly inside the app 
+- Upload video from device gallery / Record video directly inside the app
 
 ### 🧠 AI-Powered Analysis
 
-* Shuttle detection & tracking (TrackNet and YOLO-based)
-* Rally segmentation
+- Shuttle detection & tracking (TrackNet and YOLO-based)
+- Rally segmentation
 
 ### 🧮 Scoring Engine
 
-* Automatic point detection
-* Rally-based score updates
-* Match progression tracking
-* Support for singles & doubles (future)
+- Automatic point detection
+- Rally-based score updates
+- Match progression tracking
+- Support for singles & doubles (future)
 
 ### 📊 Output & Insights
 
-* Player movement analysis
-* Shuttle tracking
-* Rally count & duration (future)
-* Shot distribution (future)
-* Final match score (future)
-
+- Player movement analysis
+- Shuttle tracking
+- Rally count & duration (future)
+- Shot distribution (future)
+- Final match score (future)
 
 ---
 
@@ -55,19 +54,19 @@ Badminton scoring is fast-paced and difficult to track manually. This app aims t
 
 ### Frontend (This Repository)
 
-* **Expo (SDK 54)**
-* **React Native**
-* **Expo Router**
-* **TypeScript**
-* **Expo Video Picker** – video selection
-* **Expo Video Player** – video playback
+- **Expo (SDK 54)**
+- **React Native**
+- **Expo Router**
+- **TypeScript**
+- **Expo Video Picker** – video selection
+- **Expo Video Player** – video playback
 
 ### Backend / ML (Separate Service)
 
-* **FastAPI** (Python)
-* **OpenCV** for video frame processing
-* **YOLOv8** – player & shuttle detection
-* **TrackNet** – shuttle tracking
+- **FastAPI** (Python)
+- **OpenCV** for video frame processing
+- **YOLOv11** – player & shuttle detection
+- **TrackNet** – shuttle tracking
 
 > ⚠️ This repository focuses on the **mobile application layer**. The ML pipeline runs as a separate backend service.
 
@@ -101,9 +100,9 @@ README.md
 
 ### 1️⃣ Prerequisites
 
-* Node.js (>= 18 recommended)
-* npm or yarn
-* Expo CLI (local)
+- Node.js (>= 18 recommended)
+- npm or yarn
+- Expo CLI (local)
 
 ```bash
 npm install -g expo
@@ -140,17 +139,16 @@ npm run web
 1. User selects a **badminton match video**
 2. Video is uploaded to the backend API
 3. Backend:
+   - Extracts frames
+   - Detects players & shuttle
+   - Tracks rallies & shots
+   - Computes score logic
 
-   * Extracts frames
-   * Detects players & shuttle
-   * Tracks rallies & shots
-   * Computes score logic
 4. Processed results are returned to the app
 5. App displays:
-
-   * Match score
-   * Rally stats
-   * Visual summaries
+   - Match score
+   - Rally stats
+   - Visual summaries
 
 ---
 
@@ -175,12 +173,12 @@ Video
 
 ## 🧠 ML Roadmap
 
-* [ ] Shuttle detection with TrackNet
-* [ ] Player pose estimation (YOLOv8-Pose)
-* [ ] Shot classification using temporal models
-* [ ] Rally segmentation logic
-* [ ] Robust scoring rules for badminton
-* [ ] Offline video processing support
+- [ ] Shuttle detection with TrackNet
+- [ ] Player pose estimation (YOLOv11-Pose)
+- [ ] Shot classification using temporal models
+- [ ] Rally segmentation logic
+- [ ] Robust scoring rules for badminton
+- [ ] Offline video processing support
 
 ---
 
@@ -188,22 +186,22 @@ Video
 
 🚧 **Work in Progress**
 
-* App scaffolding complete
-* Video picker integration completed
-* Backend experimentation with YOLO & TrackNet completed
-* Court mapping pending
-* Shot detection pending
-* Rally segmentation pending
-* Scoring logic pending
+- App scaffolding complete
+- Video picker integration completed
+- Backend experimentation with YOLO & TrackNet completed
+- Court mapping pending
+- Shot detection pending
+- Rally segmentation pending
+- Scoring logic pending
 
 ---
 
 ## 🌱 Future Enhancements
 
-* Real-time scoring
-* Match replay with overlays
-* Player comparison dashboards
-* Coach & training mode
+- Real-time scoring
+- Match replay with overlays
+- Player comparison dashboards
+- Coach & training mode
 
 ---
 
@@ -211,9 +209,9 @@ Video
 
 Contributions, ideas, and feedback are welcome!
 
-* Fork the repo
-* Create a feature branch
-* Submit a pull request
+- Fork the repo
+- Create a feature branch
+- Submit a pull request
 
 ---
 
