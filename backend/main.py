@@ -1,28 +1,24 @@
-from fastapi import FastAPI, UploadFile, File, HTTPException, BackgroundTasks
-from fastapi.responses import FileResponse, StreamingResponse
-from fastapi.middleware.cors import CORSMiddleware
-from ultralytics import YOLO
-from datetime import datetime
-from pathlib import Path
-from typing import Dict
-
-from save_annotated_video_sync import process_video_sync
-from model2.train_and_track import *
-
-import cv2
-import tempfile
+import sys
 import os
-import torch
-import json
-import asyncio
+from pathlib import Path
+
+# Allow scoring_engine's internal imports (court_geometry, landing_detector, etc.)
+sys.path.insert(0, str(Path(__file__).parent / "llm"))
+
+from fastapi import FastAPI, UploadFile, File, HTTPException
+from fastapi.responses import FileResponse
+from fastapi.middleware.cors import CORSMiddleware
+from concurrent.futures import ThreadPoolExecutor
+from typing import Dict, Any
+import cv2
 import uuid
 import asyncio
+import torch
 
-import base64
+from llm.scoring_engine import ScoringEngine
 
 app = FastAPI()
 
-# Add CORS middleware
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -34,136 +30,181 @@ app.add_middleware(
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 print(f"Using device: {DEVICE}")
 
-model = YOLO("yolov8n.pt")
-
 OUTPUT_DIR = Path("outputs")
 OUTPUT_DIR.mkdir(exist_ok=True)
 
-def process_video_job(job_id: str, video_path: str):
-    """Background task to process video"""
+YOLO_WEIGHTS     = "model2/runs/detect/yolo-runs/yolo_standard/weights/best.pt"
+OBB_WEIGHTS      = "model2/runs/obb/yolo-obb/yolo_obb/weights/best.pt"
+TRACKNET_WEIGHTS = "model2/runs/train-track/tracknet_best.pth"
+
+jobs: Dict[str, Any] = {}
+_executor = ThreadPoolExecutor(max_workers=2)
+
+
+def _run_pipeline(job_id: str, video_path: str, mode: str) -> None:
     try:
-        jobs[job_id]["status"] = "processing"
-        
-        cap = cv2.VideoCapture(video_path)
-        
-        if not cap.isOpened():
-            jobs[job_id]["status"] = "error"
-            jobs[job_id]["message"] = "Could not open video"
-            return
-        
-        # Get video properties
-        fps = int(cap.get(cv2.CAP_PROP_FPS))
-        width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-        height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-        
-        jobs[job_id]["total_frames"] = total_frames
-        
-        # Create output
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        output_path = OUTPUT_DIR / f"badminton_{timestamp}_annotated.mp4"
-        
-        fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-        out = cv2.VideoWriter(str(output_path), fourcc, fps, (width, height))
-        
-        if not out.isOpened():
-            jobs[job_id]["status"] = "error"
-            jobs[job_id]["message"] = "Could not create output video"
-            cap.release()
-            return
-        
-        # Process video
-        
-        result = process_video_sync(
-            cap, out, model, pose_model, tracknet, DEVICE, 
-            total_frames, width, height, job_id, jobs
+        jobs[job_id]["status"] = "calibrating"
+
+        engine = ScoringEngine(
+            yolo_weights=YOLO_WEIGHTS,
+            obb_weights=OBB_WEIGHTS,
+            tracknet_weights=TRACKNET_WEIGHTS,
+            mode=mode,
+            tracking_mode="hybrid",
+            conf_threshold=0.25,
+            device=DEVICE,
         )
-        
+
+        engine.auto_calibrate(video_path, n_frames=60)
+
+        cap = cv2.VideoCapture(video_path)
+        if not cap.isOpened():
+            raise RuntimeError("Cannot open video file")
+
+        fps          = cap.get(cv2.CAP_PROP_FPS) or 30.0
+        width        = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        height       = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+
+        output_path = str(OUTPUT_DIR / f"{job_id}_result.mp4")
+        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+        out = cv2.VideoWriter(output_path, fourcc, fps, (width, height))
+        if not out.isOpened():
+            cap.release()
+            raise RuntimeError("Cannot create output video writer")
+
+        jobs[job_id].update({
+            "status": "processing",
+            "total_frames": total_frames,
+            "frame": 0,
+            "progress_percent": 0.0,
+            "score": [0, 0],
+        })
+
+        landing_events = []
+        frame_idx = 0
+
+        while True:
+            ret, frame = cap.read()
+            if not ret:
+                break
+
+            event = engine.process_frame(frame, frame_idx)
+            if event is not None:
+                landing_events.append({
+                    "frame": event.frame_idx,
+                    "verdict": event.verdict.value,
+                    "court_x": round(event.court_x, 3),
+                    "court_y": round(event.court_y, 3),
+                    "confidence": round(event.confidence, 3),
+                    "source": event.source,
+                    "reason": event.reason,
+                })
+
+            frame = engine.draw_court_boundaries(frame)
+            out.write(frame)
+
+            frame_idx += 1
+            jobs[job_id]["frame"] = frame_idx
+            jobs[job_id]["progress_percent"] = round(frame_idx / total_frames * 100, 1) if total_frames else 0
+            jobs[job_id]["score"] = list(engine.state.score)
+
         cap.release()
         out.release()
         os.remove(video_path)
-        
-        # Update job status
-        jobs[job_id]["status"] = "complete"
-        jobs[job_id]["output_video"] = str(output_path)
-        jobs[job_id]["unique_people"] = result["unique_people"]
-        jobs[job_id]["shuttle_detections"] = result["shuttle_detections"]
-        jobs[job_id]["total_frames"] = result["total_frames"]
-        jobs[job_id]["summary"] = {
-            "detection_rate": round((result["shuttle_detections"] / result["total_frames"]) * 100, 1) if result["total_frames"] > 0 else 0
-        }
-        
-    except Exception as e:
-        print(f"Error processing job {job_id}: {str(e)}")
+
+        jobs[job_id].update({
+            "status": "complete",
+            "output_video": output_path,
+            "score": list(engine.state.score),
+            "game": engine.state.game,
+            "landing_events": landing_events,
+            "total_landings": len(landing_events),
+        })
+
+    except Exception as exc:
+        print(f"[pipeline error] job={job_id}: {exc}")
         jobs[job_id]["status"] = "error"
-        jobs[job_id]["message"] = str(e)
+        jobs[job_id]["message"] = str(exc)
 
 
+@app.post("/upload-video")
+async def upload_video(file: UploadFile = File(...), mode: str = "singles"):
+    """Step 1: Upload the video file. Returns a job_id to track processing."""
+    if not file.filename:
+        raise HTTPException(status_code=400, detail="No file provided")
 
-@app.post("/track-human-video-async")
-async def track_human_video_async(background_tasks: BackgroundTasks, file: UploadFile = File(...)):
-    """Stream processing updates in real-time"""
-    if not file:
-        raise HTTPException(status_code=400, detail="No file uploaded")
-    
     job_id = str(uuid.uuid4())
+    video_path = str(OUTPUT_DIR / f"{job_id}_input.mp4")
 
     contents = await file.read()
-    print("Request received for streaming")
+    with open(video_path, "wb") as f:
+        f.write(contents)
 
-    tracker = ShuttleTracker(
-            yolo_weights="model2/runs/detect/yolo-runs/yolo_standard/weights/best.pt",
-            obb_weights="model2/runs/obb/yolo-obb/yolo_obb/weights/best.pt",
-            tracknet_weights="model2/runs/train-track/tracknet_best.pth",
-            device=DEVICE
-        )
-    
-    with tempfile.NamedTemporaryFile(delete=False, suffix=".mp4") as tmp:
-        tmp.write(contents)
-        video_path = tmp.name
-
-    
-    
-    # cap = cv2.VideoCapture(video_path)
-    # total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    # cap.release()
-
-    
-
-    tracker.track_video(
-            video_path=video_path,
-            output_path=OUTPUT_DIR + "/Sample_test.mp4",
-            mode="hybrid",
-            conf_threshold=0.25
-        )
-
-
-    return {
-        "message": "Video processing started successfully",
-        "video": FileResponse(
-            OUTPUT_DIR,
-            media_type="video/mp4",
-            filename="Sample_test.mp4"
-        )
+    jobs[job_id] = {
+        "status": "uploaded",
+        "video_path": video_path,
+        "mode": mode,
+        "frame": 0,
+        "total_frames": 0,
+        "progress_percent": 0.0,
+        "score": [0, 0],
     }
+
+    return {"job_id": job_id, "status": "uploaded"}
+
+
+@app.post("/process-video/{job_id}")
+async def process_video(job_id: str):
+    """Step 2: Start the analysis pipeline for an uploaded video."""
+    if job_id not in jobs:
+        raise HTTPException(status_code=404, detail="Job not found")
+    if jobs[job_id]["status"] not in ("uploaded", "error"):
+        raise HTTPException(
+            status_code=400,
+            detail=f"Job is already '{jobs[job_id]['status']}' — cannot start processing",
+        )
+
+    video_path = jobs[job_id]["video_path"]
+    mode       = jobs[job_id].get("mode", "singles")
+
+    loop = asyncio.get_event_loop()
+    loop.run_in_executor(_executor, _run_pipeline, job_id, video_path, mode)
+
+    return {"job_id": job_id, "status": "processing"}
 
 
 @app.get("/job-status/{job_id}")
-async def get_job_status(job_id: str):
-    """Get current status of processing job"""
+async def job_status(job_id: str):
+    """Poll for live progress: status, frame count, score, progress %."""
     if job_id not in jobs:
         raise HTTPException(status_code=404, detail="Job not found")
-    
     return jobs[job_id]
 
 
-@app.get("/download-video")
-async def download_video(path: str):
-    if not os.path.exists(path):
-        raise HTTPException(status_code=404, detail="Video not found")
-    
+@app.get("/results/{job_id}")
+async def get_results(job_id: str):
+    """Fetch the full results once processing is complete."""
+    if job_id not in jobs:
+        raise HTTPException(status_code=404, detail="Job not found")
+    if jobs[job_id]["status"] != "complete":
+        raise HTTPException(
+            status_code=400,
+            detail=f"Job not complete (current status: {jobs[job_id]['status']})",
+        )
+    return jobs[job_id]
+
+
+@app.get("/download/{job_id}")
+async def download_video(job_id: str):
+    """Download the annotated output video."""
+    if job_id not in jobs:
+        raise HTTPException(status_code=404, detail="Job not found")
+    path = jobs[job_id].get("output_video")
+    if not path or not os.path.exists(path):
+        raise HTTPException(status_code=404, detail="Output video not ready")
     return FileResponse(
         path,
         media_type="video/mp4",
-        filename=os.path.basename(path)
+        filename=f"badminton_{job_id[:8]}_result.mp4",
     )

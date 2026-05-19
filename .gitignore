@@ -67,6 +67,10 @@ backend/model2/models/
 backend/model2/output_video
 backend/court_mapping/output/
 
+ruvector.db
+.claude
+.claudecode
+.claude-flow
 
-
-
+.swarm
+.mcp.json
