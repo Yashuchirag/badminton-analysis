@@ -68,6 +68,12 @@ try:
         cv2.putText(frame, f"Game {engine.state.game}", (width - 160, 45),
                     cv2.FONT_HERSHEY_DUPLEX, 1.0, (200, 200, 200), 2)
 
+        # Rally state + last hitter debug overlay
+        rs_color = (0, 200, 0) if engine.state.rally_state == "RALLY_ACTIVE" else (0, 140, 255)
+        lh = engine.state.last_hitter_side or "?"
+        cv2.putText(frame, f"{engine.state.rally_state} | hitter={lh}", (10, height - 55),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, rs_color, 1)
+
         serving = engine.state.serving_side
         serve_x = 85 if serving == 0 else 150
         cv2.circle(frame, (serve_x, 58), 5, (0, 255, 255), -1)

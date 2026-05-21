@@ -108,6 +108,8 @@ def _run_pipeline(job_id: str, video_path: str, mode: str) -> None:
             jobs[job_id]["frame"] = frame_idx
             jobs[job_id]["progress_percent"] = round(frame_idx / total_frames * 100, 1) if total_frames else 0
             jobs[job_id]["score"] = list(engine.state.score)
+            jobs[job_id]["rally_state"] = engine.state.rally_state
+            jobs[job_id]["last_hitter_side"] = engine.state.last_hitter_side
 
         cap.release()
         out.release()
