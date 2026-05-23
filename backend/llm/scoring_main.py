@@ -1,3 +1,4 @@
+# pyrefly: ignore [missing-import]
 import cv2
 import sys, os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
@@ -6,12 +7,13 @@ from gemma_client import LineJudge
 from scoring_engine import ScoringEngine
 
 # ── Video to process ──────────────────────────────────────────────────────────
-VIDEO_PATH = "model2/dataset/TrackNetV2_Dataset/Professional/match3/video/2_18_15.mp4"
+VIDEO_PATH = "model2/dataset/TrackNetV2_Dataset/Professional/match2/video/merged_20260520_174554.mp4"
+OUTPUT_PATH = "scored_output_1.mp4"
 
 judge = LineJudge(model="gemma4:e4b")
 
 engine = ScoringEngine(
-    obb_weights="model2/models/claudette_trained/yolo_obb/weights/best.pt",
+    obb_weights="model2/models/claudette_trained/yolo_obb_finetune/weights/best.pt",
     tracknet_weights="model2/models/claudette_trained/tracknetv2/tracknetv2_best.pth",
     gemma=judge,
     mode="singles",
@@ -35,7 +37,7 @@ fps    = int(cap.get(cv2.CAP_PROP_FPS))
 width  = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
 height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
 fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-out    = cv2.VideoWriter("scored_output_2.mp4", fourcc, fps, (width, height))
+out    = cv2.VideoWriter(OUTPUT_PATH, fourcc, fps, (width, height))
 
 frame_idx = 0
 
@@ -99,6 +101,6 @@ except KeyboardInterrupt:
 finally:
     cap.release()
     out.release()
-    print(f"\n✓ Saved → scored_output_2.mp4")
+    print(f"\n✓ Saved → {OUTPUT_PATH}")
     print(f"  Final score : {engine.state.score}")
     print(f"  Total points: {len(engine.state.history)}")

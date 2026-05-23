@@ -3,11 +3,62 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import List, Optional, Tuple
 
+# pyrefly: ignore [missing-import]
 import cv2
+# pyrefly: ignore [missing-import]
 import numpy as np
 
-# Reuse canonical court constants and homography helper from the existing module.
-from llm.court_geometry import COURT, CourtHomography
+
+# BWF court dimensions (metres)
+COURT = {
+    "singles": {"length": 13.40, "width": 5.18},
+    "doubles": {"length": 13.40, "width": 6.1},
+}
+
+# Zone polygons in metres from court centre (0, 0)
+ZONES = {
+    "singles_back":   [(-6.7, -2.59), (6.7, -2.59), (6.7, 2.59), (-6.7, 2.59)],
+    "doubles_back":   [(-6.7, -3.05), (6.7, -3.05), (6.7, 3.05), (-6.7, 3.05)],
+    "service_near":   [(-6.7, -2.59), (0,   -2.59), (0,  2.59),  (-6.7, 2.59)],
+    "service_far":    [(0,    -2.59), (6.7, -2.59), (6.7, 2.59),  (0,   2.59)],
+}
+
+# Margin within which we escalate to Gemma4 (metres)
+LINE_MARGIN = 0.15
+
+_COURT_PTS = {
+    "singles": [[6.7, 2.59], [6.7, -2.59], [-6.7, -2.59], [-6.7, 2.59]],
+    "doubles": [[6.7, 3.05], [6.7, -3.05], [-6.7, -3.05], [-6.7, 3.05]],
+}
+
+
+class CourtHomography:
+    def __init__(self):
+        self.H = None
+        self.H_inv = None
+
+    def calibrate(self, pixel_pts: np.ndarray, court_pts: np.ndarray):
+        self.H, _ = cv2.findHomography(pixel_pts, court_pts)
+        if self.H is not None:
+            self.H_inv = np.linalg.inv(self.H)
+
+    def to_court(self, px: float, py: float) -> tuple:
+        if self.H is None:
+            raise RuntimeError("Homography not calibrated — call calibrate() first")
+        pt = np.array([[[px, py]]], dtype=np.float32)
+        out = cv2.perspectiveTransform(pt, self.H)
+        return float(out[0][0][0]), float(out[0][0][1])
+
+
+def point_in_polygon(x: float, y: float, polygon: list) -> bool:
+    pts = np.array(polygon, dtype=np.float32).reshape((-1, 1, 2))
+    return cv2.pointPolygonTest(pts, (float(x), float(y)), measureDist=False) >= 0
+
+
+def distance_to_boundary(x: float, y: float, polygon: list) -> float:
+    """Returns signed distance (metres); positive = inside, negative = outside."""
+    pts = np.array(polygon, dtype=np.float32).reshape((-1, 1, 2))
+    return cv2.pointPolygonTest(pts, (float(x), float(y)), measureDist=True)
 
 
 # ─── Corner ordering ────────────────────────────────────────────────────────
@@ -167,12 +218,14 @@ def canonical_court_lines(mode: str = "doubles") -> List[CourtLine]:
 
     lines: List[CourtLine] = []
 
-    # Outer doubles boundary
+    # Outer boundary width depends on mode — must match what fit_homography used.
+    outer_half = singles_half if mode == "singles" else doubles_half
+
     lines += [
-        CourtLine("baseline_far",    (+half_len, +doubles_half), (+half_len, -doubles_half), "boundary"),
-        CourtLine("baseline_near",   (-half_len, +doubles_half), (-half_len, -doubles_half), "boundary"),
-        CourtLine("sideline_left",   (+half_len, +doubles_half), (-half_len, +doubles_half), "boundary"),
-        CourtLine("sideline_right",  (+half_len, -doubles_half), (-half_len, -doubles_half), "boundary"),
+        CourtLine("baseline_far",    (+half_len, +outer_half), (+half_len, -outer_half), "boundary"),
+        CourtLine("baseline_near",   (-half_len, +outer_half), (-half_len, -outer_half), "boundary"),
+        CourtLine("sideline_left",   (+half_len, +outer_half), (-half_len, +outer_half), "boundary"),
+        CourtLine("sideline_right",  (+half_len, -outer_half), (-half_len, -outer_half), "boundary"),
     ]
 
     if mode == "doubles":
@@ -192,12 +245,9 @@ def canonical_court_lines(mode: str = "doubles") -> List[CourtLine]:
                       (-long_service_doubles, -doubles_half),
                       "service"),
         ]
-    else:
-        # Singles long service line == singles baseline (no separate line).
-        pass
 
-    # Net (centre)
-    lines.append(CourtLine("net", (0.0, +doubles_half), (0.0, -doubles_half), "center"))
+    # Net (centre) — spans the outer boundary width for the current mode.
+    lines.append(CourtLine("net", (0.0, +outer_half), (0.0, -outer_half), "center"))
 
     # Short service lines (both sides of net)
     half = doubles_half if mode == "doubles" else singles_half

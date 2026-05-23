@@ -32,11 +32,11 @@ _SIDES = [(0, 1), (1, 2), (2, 3), (3, 0)]
 def refine_corners(
     image: np.ndarray,
     rough_corners: np.ndarray,
-    corridor_outward_sideline: int = 20,
+    corridor_outward_sideline: int = 50,
     corridor_inward_sideline: int = 90,
-    corridor_outward_baseline: int = 20,
-    corridor_inward_baseline: int = 20,
-    angle_tol_deg: float = 12.0,
+    corridor_outward_baseline: int = 50,
+    corridor_inward_baseline: int = 30,
+    angle_tol_deg: float = 10.0,
     debug: bool = False,
 ) -> RefinementResult:
     
@@ -89,6 +89,9 @@ def refine_corners(
             corridor_masks.append(corridor)
         candidates = _filter_segments_to_corridor(segs, corridor)
         candidates = _filter_by_angle(candidates, p1, p2, angle_tol_deg)
+        # Prefer segments on the outward side of the rough boundary so RANSAC
+        # snaps to the outer edge of the white line, not the inner edge.
+        candidates = _prefer_outer_segments(candidates, p1, p2, inward_dir)
         if debug:
             per_side_segments.append(candidates)
 
@@ -314,6 +317,34 @@ def _normalise_angle(a: float) -> float:
     """Return angle in [0, 180)."""
     a = a % 180.0
     return a + 180.0 if a < 0 else a
+
+
+def _prefer_outer_segments(
+    segments: List[Tuple[float, float, float, float]],
+    p1: np.ndarray,
+    p2: np.ndarray,
+    inward_dir: Optional[np.ndarray],
+) -> List[Tuple[float, float, float, float]]:
+    """Return segments on the outward side of the rough boundary (p1→p2).
+
+    The rough corners from the HSV mask land on the inner edge of the white
+    court lines. This filter keeps only segments whose midpoint is on the
+    outward side (away from the court interior), which forces RANSAC to fit
+    the outer edge of the white line rather than the inner edge.
+    Falls back to all segments when fewer than 2 qualify.
+    """
+    if inward_dir is None or len(segments) == 0:
+        return segments
+    side_mid = (np.asarray(p1, dtype=np.float64) + np.asarray(p2, dtype=np.float64)) / 2.0
+    outer = []
+    for seg in segments:
+        mx = (seg[0] + seg[2]) / 2.0
+        my = (seg[1] + seg[3]) / 2.0
+        vec = np.array([mx - side_mid[0], my - side_mid[1]], dtype=np.float64)
+        # dot > 0 → segment is inward; dot <= 0 → segment is outward or on the line
+        if float(np.dot(vec, inward_dir)) <= 0.0:
+            outer.append(seg)
+    return outer if len(outer) >= 2 else segments
 
 
 # ─── Line fitting & intersection ────────────────────────────────────────────

@@ -1,4 +1,6 @@
+# pyrefly: ignore [missing-import]
 import numpy as np
+# pyrefly: ignore [missing-import]
 import cv2
 from dataclasses import dataclass, field
 from typing import Optional
@@ -6,7 +8,8 @@ from enum import Enum
 import sys, os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-from court_geometry import CourtHomography, ZONES, LINE_MARGIN, distance_to_boundary
+from court_mapping.geometry import CourtHomography, ZONES, LINE_MARGIN, distance_to_boundary
+from court_mapping.detector import detect_court_in_video
 from model2.train_and_track import ShuttleTracker
 from landing_detector import LandingDetector, RawDetection
 from gemma_client import LineJudge
@@ -62,7 +65,7 @@ class ScoringEngine:
             tracking_mode: str = "hybrid",    # passed to ShuttleTracker
             conf_threshold: float = 0.25,
             device: str = "cpu",
-            player_model: str = "yolov8n.pt",   # pretrained model for player detection
+            player_model: str = "yolo11n.pt",   # pretrained model for player detection
             player_detection_interval: int = 30, # run player detector every N frames
         ):
         self.game_mode = mode
@@ -82,7 +85,7 @@ class ScoringEngine:
 
         self.court = CourtHomography()
         self.landing = LandingDetector()
-        self.players = PlayerTracker(model_path=player_model)
+        self.players = PlayerTracker(model_path=player_model, device=device)
         self._player_detection_interval = player_detection_interval
 
         # ── Post-candidate confirmation window ───────────────────────────────
@@ -115,16 +118,22 @@ class ScoringEngine:
         """
         Auto-detect court corners from the video and calibrate the homography.
         Call this once before starting process_frame().
-
-        Args:
-            video_path: path to the video file (same one you'll process).
-            n_frames:   how many frames to sample for line accumulation.
-            debug:      if True, saves debug_court_mask_*.png images showing
-                        what the detector sees — useful when detection fails.
-        Returns the detected pixel corner list.
         """
-        return self.court.auto_calibrate(video_path, mode=self.game_mode,
-                                         n_frames=n_frames, debug=debug)
+        result = detect_court_in_video(
+            video_path=video_path,
+            mode=self.game_mode,
+            n_frames=n_frames,
+            refine=True,
+            keep_artifacts=debug,
+        )
+        if not result.success or result.homography is None:
+            raise RuntimeError(
+                f"Court detection failed (confidence={result.confidence}). "
+                f"Notes: {result.notes}"
+            )
+        self.court.H = result.homography.H
+        self.court.H_inv = result.homography.H_inv
+        return result.refined_corners.tolist() if result.refined_corners is not None else []
 
     def calibrate(self, pixel_pts: list, court_pts: list):
         """Manual calibration fallback — prefer auto_calibrate() instead."""

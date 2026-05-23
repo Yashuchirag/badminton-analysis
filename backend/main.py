@@ -2,7 +2,7 @@ import sys
 import os
 from pathlib import Path
 
-# Allow scoring_engine's internal imports (court_geometry, landing_detector, etc.)
+# Allow scoring_engine's internal imports (landing_detector, gemma_client, etc.)
 sys.path.insert(0, str(Path(__file__).parent / "llm"))
 
 from fastapi import FastAPI, UploadFile, File, HTTPException

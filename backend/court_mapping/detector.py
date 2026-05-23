@@ -4,11 +4,11 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import List, Optional, Tuple, Union
 
+# pyrefly: ignore [missing-import]
 import numpy as np
 
-from llm.court_geometry import CourtHomography
-
 from .geometry import (
+    CourtHomography,
     CourtLine,
     fit_homography,
     mask_to_quadrilateral,

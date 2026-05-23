@@ -59,7 +59,9 @@ def segment_court_hsv(
     # Close: bridge across the painted court lines (these are inside the court
     # surface but appear as gaps in the HSV mask). Kernel size scales with
     # frame width to track resolution.
-    close_px = max(20, w // 30)
+    # Court lines are ~3-8 px wide so a small kernel bridges them.
+    # w//30 was too large and bridged the run-off zone into the advertising boards.
+    close_px = max(10, w // 80)
     k_close = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (close_px, close_px))
     mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, k_close)
 

@@ -1,10 +1,16 @@
 from .detector import CourtDetectionResult, detect_court_in_video
 from .geometry import (
+    COURT,
+    ZONES,
+    LINE_MARGIN,
+    CourtHomography,
     CourtLine,
     canonical_court_lines,
+    distance_to_boundary,
     fit_homography,
     mask_to_quadrilateral,
     order_corners,
+    point_in_polygon,
     project_court_lines,
     validate_corners,
 )
@@ -18,11 +24,17 @@ __all__ = [
     "CourtDetectionResult",
     "detect_court_in_video",
     # geometry
+    "COURT",
+    "ZONES",
+    "LINE_MARGIN",
+    "CourtHomography",
     "CourtLine",
     "canonical_court_lines",
+    "distance_to_boundary",
     "fit_homography",
     "mask_to_quadrilateral",
     "order_corners",
+    "point_in_polygon",
     "project_court_lines",
     "validate_corners",
     # lines

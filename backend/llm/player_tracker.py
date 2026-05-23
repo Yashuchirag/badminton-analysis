@@ -56,9 +56,11 @@ class PlayerTracker:
         conf: float = 0.4,
         iou_threshold: float = 0.3,
         max_frames_lost: int = 20,
+        device: str = "cpu",
     ):
         from ultralytics import YOLO
         self._model = YOLO(model_path)
+        self._device = device
         self._conf = conf
         self._iou_threshold = iou_threshold
         self._max_frames_lost = max_frames_lost
@@ -95,7 +97,7 @@ class PlayerTracker:
     # ── Internal methods ──────────────────────────────────────────────────────
 
     def _detect(self, frame: np.ndarray) -> list[tuple]:
-        results = self._model(frame, classes=[0], conf=self._conf, verbose=False)
+        results = self._model(frame, classes=[0], conf=self._conf, verbose=False, device=self._device)
         boxes = []
         for r in results:
             for box in r.boxes:
