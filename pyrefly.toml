@@ -1,0 +1,8 @@
+[python]
+python_interpreter = "backend/ubenv/bin/python3"
+
+[errors]
+# Suppress missing-import errors for packages not resolvable from the
+# configured interpreter (e.g. torch installed with a custom CUDA index-url).
+# Remove this line once all packages are confirmed present in the venv.
+ignore_missing_imports = true
