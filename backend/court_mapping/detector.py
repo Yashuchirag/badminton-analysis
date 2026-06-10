@@ -88,7 +88,7 @@ def detect_court_in_video(
 
     # ── 4. line-based corner refinement ──────────────────────────────────
     if refine:
-        refinement = refine_corners(median.median_frame, rough)
+        refinement = refine_corners(median.median_frame, rough, surface_mask=seg.mask)
         refined = refinement.refined_corners
         used_refinement = refinement.used_refinement_mask
         n_refined = sum(used_refinement)

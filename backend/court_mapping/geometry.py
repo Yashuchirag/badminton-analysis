@@ -26,12 +26,6 @@ ZONES = {
 # Margin within which we escalate to Gemma4 (metres)
 LINE_MARGIN = 0.15
 
-_COURT_PTS = {
-    "singles": [[6.7, 2.59], [6.7, -2.59], [-6.7, -2.59], [-6.7, 2.59]],
-    "doubles": [[6.7, 3.05], [6.7, -3.05], [-6.7, -3.05], [-6.7, 3.05]],
-}
-
-
 class CourtHomography:
     def __init__(self):
         self.H = None

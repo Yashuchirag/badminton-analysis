@@ -10,6 +10,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from court_mapping.geometry import CourtHomography, ZONES, LINE_MARGIN, distance_to_boundary
 from court_mapping.detector import detect_court_in_video
+from court_mapping.visualize import draw_court_overlay
 from model2.train_and_track import ShuttleTracker
 from landing_detector import LandingDetector, RawDetection
 from gemma_client import LineJudge
@@ -84,6 +85,7 @@ class ScoringEngine:
         )
 
         self.court = CourtHomography()
+        self._projected_lines = []   # canonical court lines in pixel space, set by auto_calibrate
         self.landing = LandingDetector()
         self.players = PlayerTracker(model_path=player_model, device=device)
         self._player_detection_interval = player_detection_interval
@@ -119,9 +121,13 @@ class ScoringEngine:
         Auto-detect court corners from the video and calibrate the homography.
         Call this once before starting process_frame().
         """
+        # The corner detector always finds the OUTERMOST painted lines, i.e. the
+        # doubles boundary, so the homography must be fitted in the doubles
+        # frame regardless of game mode. The game mode only selects which zone
+        # polygon (self._zone_poly) is used for IN/OUT judgement.
         result = detect_court_in_video(
             video_path=video_path,
-            mode=self.game_mode,
+            mode="doubles",
             n_frames=n_frames,
             refine=True,
             keep_artifacts=debug,
@@ -133,12 +139,8 @@ class ScoringEngine:
             )
         self.court.H = result.homography.H
         self.court.H_inv = result.homography.H_inv
+        self._projected_lines = result.projected_lines
         return result.refined_corners.tolist() if result.refined_corners is not None else []
-
-    def calibrate(self, pixel_pts: list, court_pts: list):
-        """Manual calibration fallback — prefer auto_calibrate() instead."""
-        self.court.calibrate(np.array(pixel_pts, dtype=np.float32),
-                             np.array(court_pts, dtype=np.float32))
 
     def process_frame(
             self,
@@ -373,66 +375,13 @@ class ScoringEngine:
 
     def draw_court_boundaries(self, frame: np.ndarray) -> np.ndarray:
         """
-        Draw all standard court lines onto *frame* in-place and return it.
-
-        Lines drawn (singles):
-          • Outer boundary          — solid yellow
-          • Net                     — solid cyan
-          • Short service lines     — white, both sides
-          • Center line             — white, full length
-
-        For doubles, the outer boundary switches to the wider sidelines and
-        the doubles long-service line is added.
+        Draw the detected court grid onto the frame and return the annotated
+        copy. Uses the canonical lines projected by court_mapping during
+        auto_calibrate(); returns the frame unchanged if not calibrated.
         """
-        if self.court.H_inv is None:
+        if not self._projected_lines:
             return frame
-
-        def _proj(*pts):
-            """Project one or more (x, y) court-coord tuples → int pixel pairs."""
-            arr = np.array(pts, dtype=np.float32).reshape(-1, 1, 2)
-            out = cv2.perspectiveTransform(arr, self.court.H_inv)
-            return [tuple(p.astype(int)) for p in out.reshape(-1, 2)]
-
-        half_l = 6.70          # court half-length (metres)
-        sw     = 2.59          # singles half-width
-        dw     = 3.05          # doubles half-width
-        ssl    = 1.98          # short service line distance from net
-
-        half_w = dw if self.game_mode == "doubles" else sw
-
-        # ── Outer boundary ───────────────────────────────────────────────────
-        corners = _proj(
-            (-half_l, -half_w), ( half_l, -half_w),
-            ( half_l,  half_w), (-half_l,  half_w),
-        )
-        cv2.polylines(frame,
-                      [np.array(corners, dtype=np.int32).reshape(-1, 1, 2)],
-                      isClosed=True, color=(0, 220, 220), thickness=2)
-
-        # ── Net ──────────────────────────────────────────────────────────────
-        n1, n2 = _proj((0, -half_w), (0, half_w))
-        cv2.line(frame, n1, n2, color=(255, 220, 0), thickness=2)
-
-        # ── Short service lines (both sides of net) ───────────────────────────
-        for sx in (ssl, -ssl):
-            p1, p2 = _proj((sx, -half_w), (sx, half_w))
-            cv2.line(frame, p1, p2, color=(200, 200, 200), thickness=1)
-
-        # ── Center line (full length) ─────────────────────────────────────────
-        c1, c2 = _proj((-half_l, 0), (half_l, 0))
-        cv2.line(frame, c1, c2, color=(200, 200, 200), thickness=1)
-
-        # ── Singles sidelines (inner) when in doubles mode ────────────────────
-        if self.game_mode == "doubles":
-            for sy in (sw, -sw):
-                p1, p2 = _proj((-half_l, sy), (half_l, sy))
-                cv2.line(frame, p1, p2, color=(160, 160, 160), thickness=1)
-            # Doubles long service line (0.76 m inside back boundary)
-            for sx in (half_l - 0.76, -(half_l - 0.76)):
-                p1, p2 = _proj((sx, -dw), (sx, dw))
-                cv2.line(frame, p1, p2, color=(160, 160, 160), thickness=1)
-
-        return frame
+        return draw_court_overlay(frame, self._projected_lines, corners=None)
 
     def _draw_court_overlay(
             self, frame: np.ndarray,

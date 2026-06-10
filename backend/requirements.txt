@@ -1,0 +1,27 @@
+# Core backend
+fastapi==0.110.0
+uvicorn[standard]==0.27.1
+
+# Multipart upload support
+python-multipart==0.0.9
+
+# PyTorch with CUDA (installed separately via index-url) updated manually
+# torch==2.5.1+cu121
+# torchvision
+
+# YOLO / Ultralytics
+ultralytics==8.4.14
+
+# Computer Vision
+opencv-python==4.9.0.80
+numpy==1.26.4
+pandas
+
+# Utilities
+tqdm==4.66.2
+pillow==10.2.0
+
+matplotlib>=3.7.0
+scipy>=1.10.0
+PyYAML>=6.0
+filterpy>=1.4.5

@@ -51,7 +51,7 @@ try:
         score   = engine.state.score
 
         # ── Court boundary overlay ────────────────────────────────────────
-        engine.draw_court_boundaries(frame)
+        frame = engine.draw_court_boundaries(frame)
 
         # ── Score overlay ─────────────────────────────────────────────────
         cv2.rectangle(frame, (0, 0), (width, 70), (0, 0, 0), -1)

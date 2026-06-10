@@ -38,7 +38,7 @@ def segment_court_hsv(
     if patch_near.size == 0:
         return None
 
-    not_white = patch_near[:, :, 1] > 30
+    not_white = patch_near[:, :, 1] > 50
     hues_n = patch_near[:, :, 0][not_white] if not_white.any() else patch_near[:, :, 0].flatten()
     near_hue = float(np.median(hues_n))
     near_sat = float(np.median(patch_near[:, :, 1]))
