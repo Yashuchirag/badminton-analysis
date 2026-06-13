@@ -2,6 +2,7 @@
 import numpy as np
 # pyrefly: ignore [missing-import]
 import cv2
+from collections import deque
 from dataclasses import dataclass, field
 from typing import Optional
 from enum import Enum
@@ -12,11 +13,7 @@ from court_mapping.geometry import CourtHomography, ZONES, LINE_MARGIN, distance
 from court_mapping.detector import detect_court_in_video
 from court_mapping.visualize import draw_court_overlay
 from model2.train_and_track import ShuttleTracker
-from landing_detector import LandingDetector, RawDetection
-from gemma_client import LineJudge
 from player_tracker import PlayerTracker
-
-
 
 
 WINNING_SCORE  = 21
@@ -39,7 +36,6 @@ class LandingEvent:
     source:     str              # "yolo" | "obb" | "tracknet" | "fused"
     near_line:  bool  = False
     verdict:    Verdict = Verdict.PENDING
-    gemma_used: bool  = False
     reason:     str   = ""
 
 
@@ -47,7 +43,7 @@ class LandingEvent:
 class MatchState:
     score:            list[int] = field(default_factory=lambda: [0, 0])
     serving_side:     int  = 0
-    last_hitter_side: Optional[str] = None   # "LEFT" or "RIGHT", set by net crossing
+    last_hitter_side: Optional[str] = None   # "LEFT" or "RIGHT"
     side_to_player:   dict = field(default_factory=lambda: {"LEFT": 0, "RIGHT": 1})
     rally_state:      str  = "SERVE_PENDING"  # "SERVE_PENDING" | "RALLY_ACTIVE"
     game:             int  = 1
@@ -55,28 +51,64 @@ class MatchState:
 
 
 class ScoringEngine:
+    """
+    Geometric, event-driven rally scorer. The shuttle trajectory itself drives
+    a small state machine:
+
+      SERVE_PENDING ──sustained motion──▶ RALLY_ACTIVE ──rally end──▶ point
+                                                ▲                        │
+                                                └────── cooldown ────────┘
+
+    Hits are sharp direction changes in the trajectory (the court half where
+    they happen identifies the hitter). A rally ends when the shuttle comes to
+    rest low in the frame, or vanishes while descending near the floor.
+    Verdicts are pure homography geometry — no LLM is used or imported.
+    """
+
+    # ── Rally start: sustained launch motion ─────────────────────────────────
+    _LAUNCH_SPEED  = 8.0   # px/frame
+    _LAUNCH_FRAMES = 3     # consecutive fast frames to call the serve
+
+    # ── Hit detection: sharp trajectory direction change ─────────────────────
+    _HIT_MIN_SPEED = 6.0                       # px/frame on both legs
+    _HIT_MAX_COS   = float(np.cos(np.radians(55)))  # direction change > 55°
+    _HIT_GAP_MAX   = 8     # max frame gap between trajectory points
+    _HIT_COOLDOWN  = 4     # min frames between two detected hits
+
+    # ── Rally end ─────────────────────────────────────────────────────────────
+    _FLOOR_RATIO   = 0.55  # fallback "low in frame" gate when uncalibrated
+    _STILL_SPEED   = 3.0   # px/frame
+    _STILL_FRAMES  = 5     # consecutive slow frames = shuttle at rest
+    _GONE_FRAMES   = 10    # frames with no detection after a descending low ball
+    _ABORT_FRAMES  = 150   # no detections at all → abort rally, no point
+
+    # ── After a point: ignore the shuttle being picked up / walked back ──────
+    _POINT_COOLDOWN = 75   # frames
+
+    _MAX_PLAUSIBLE_OUT = 2.0  # metres past the line; further = false detection
 
     def __init__(
             self,
             yolo_weights: Optional[str] = None,
             obb_weights: Optional[str] = None,
             tracknet_weights: Optional[str] = None,
-            gemma: Optional[LineJudge] = None,
             mode: str = "singles",
             tracking_mode: str = "hybrid",    # passed to ShuttleTracker
             conf_threshold: float = 0.25,
             device: str = "cpu",
             player_model: str = "yolo11n.pt",   # pretrained model for player detection
             player_detection_interval: int = 30, # run player detector every N frames
+            detect_stride: int = 1,              # run shuttle inference every Nth frame
+            yolo_conf_skip_tracknet: float = 0.65,  # YOLO conf above which TrackNet is skipped
         ):
         self.game_mode = mode
         self.tracking_mode = tracking_mode
         self.conf_threshold = conf_threshold
+        self.detect_stride = max(1, detect_stride)
+        self.yolo_conf_skip_tracknet = yolo_conf_skip_tracknet
         self.state = MatchState()
-        self.gemma = gemma
         self._zone_poly = ZONES["doubles_back"] if mode == "doubles" else ZONES["singles_back"]
 
-        # Your real ShuttleTracker — loads models exactly as your CLI does
         self.tracker = ShuttleTracker(
             yolo_weights=yolo_weights,
             obb_weights=obb_weights,
@@ -86,34 +118,20 @@ class ScoringEngine:
 
         self.court = CourtHomography()
         self._projected_lines = []   # canonical court lines in pixel space, set by auto_calibrate
-        self.landing = LandingDetector()
         self.players = PlayerTracker(model_path=player_model, device=device)
         self._player_detection_interval = player_detection_interval
 
-        # ── Post-candidate confirmation window ───────────────────────────────
-        # LandingDetector emits *candidates* (includes racket hits).
-        # We hold each candidate for CONFIRM_WINDOW frames and watch whether
-        # the shuttle comes back moving fast.  If it does → racket hit → cancel.
-        # If it stays gone / slow → floor landing → score.
-        self._CONFIRM_WINDOW  = 10    # frames to observe after a candidate
-        self._CANCEL_SPEED    = 22.0  # px/frame: above this = still in flight
-        self._FLOOR_HEIGHT_RATIO = 0.55  # shuttle must be below this % of frame height
-        self._pending_event: Optional[LandingEvent] = None
-        self._pending_countdown: int = 0
-        self._pending_prev_pos: Optional[tuple] = None
-
-        # ── Net crossing + pixel speed tracking ──────────────────────────────
-        self._prev_court_x: Optional[float] = None
-        self._prev_pixel_pos: Optional[tuple] = None
-        self._pixel_speed: float = 0.0
         self._frame_height: Optional[int] = None
-
-        # ── Serve detection ───────────────────────────────────────────────────
-        self._SERVE_LOW_SPEED    = 5.0   # px/frame — shuttle "at rest" near server
-        self._SERVE_LAUNCH_SPEED = 8.0   # px/frame — shuttle launched
-        self._SERVE_STILL_FRAMES = 3     # consecutive still frames before candidate set
-        self._serve_candidate_side: Optional[str] = None
-        self._serve_still_count: int = 0
+        self.last_shuttle: Optional[tuple] = None  # (x, y, conf, source) for this frame, for visualization
+        self._floor_min_y: Optional[float] = None  # pixel y of the far baseline, set by auto_calibrate
+        self._traj: deque = deque(maxlen=12)   # (frame_idx, x, y)
+        self._prev_court_x: Optional[float] = None
+        self._last_det: Optional[tuple] = None  # (frame_idx, x, y, conf, source, vy)
+        self._launch_count = 0
+        self._slow_count = 0
+        self._last_hit_frame = -10**9
+        self._rally_start_frame = 0
+        self._cooldown = 0
 
     def auto_calibrate(self, video_path: str, n_frames: int = 90,
                        debug: bool = False) -> list:
@@ -140,14 +158,18 @@ class ScoringEngine:
         self.court.H = result.homography.H
         self.court.H_inv = result.homography.H_inv
         self._projected_lines = result.projected_lines
+
+        # Pixel y of the far baseline: any floor landing appears at or below
+        # this row, so it replaces the crude frame-height floor gate.
+        corners = np.array(self._zone_poly, dtype=np.float32).reshape((-1, 1, 2))
+        pix = cv2.perspectiveTransform(corners, self.court.H_inv).reshape(-1, 2)
+        self._floor_min_y = float(pix[:, 1].min())
+
         return result.refined_corners.tolist() if result.refined_corners is not None else []
 
-    def process_frame(
-            self,
-            frame,
-            frame_idx: int,
-        ) -> Optional[LandingEvent]:
+    def process_frame(self, frame, frame_idx: int) -> Optional[LandingEvent]:
         self._frame_height = frame.shape[0]
+        self.last_shuttle = None
 
         # ── Player side mapping (runs every N frames, low overhead) ──────────
         if frame_idx % self._player_detection_interval == 0:
@@ -155,24 +177,51 @@ class ScoringEngine:
             if len(side_map) == 2:
                 self.state.side_to_player = side_map
 
+        # ── Stride skip: no shuttle inference on non-stride frames ───────────
+        # Interpolated positions are visualization-only and never enter _traj,
+        # so hit detection still runs between real detections with correct
+        # gap normalization.
+        if self.detect_stride > 1 and frame_idx % self.detect_stride != 0:
+            if self._cooldown > 0:
+                self._cooldown -= 1
+            self.tracker.frame_buffer.append(frame.copy())
+            if len(self._traj) >= 2:
+                (t0, x0, y0), (t1, x1, y1) = list(self._traj)[-2:]
+                gap = t1 - t0
+                if gap > 0 and 0 < frame_idx - t1 <= self._HIT_GAP_MAX:
+                    k = frame_idx - t1
+                    self.last_shuttle = (x1 + (x1 - x0) / gap * k,
+                                         y1 + (y1 - y0) / gap * k,
+                                         0.0, "interp")
+            return None
+
+        # ── Post-point cooldown: shuttle is being picked up, ignore it ───────
+        if self._cooldown > 0:
+            self._cooldown -= 1
+            return None
+
         pos, conf, source = self.tracker.predict_frame(
             frame,
             mode=self.tracking_mode,
             conf_threshold=self.conf_threshold,
+            yolo_conf_skip_tracknet=self.yolo_conf_skip_tracknet,
         )
 
-        # ── Pixel speed (used by serve detection) ────────────────────────────
+        # ── Trajectory bookkeeping ────────────────────────────────────────────
+        speed = None
         if pos is not None:
-            self._pixel_speed = (
-                np.hypot(pos[0] - self._prev_pixel_pos[0],
-                         pos[1] - self._prev_pixel_pos[1])
-                if self._prev_pixel_pos else 0.0
-            )
-            self._prev_pixel_pos = pos
-        else:
-            self._pixel_speed = 0.0
+            self.last_shuttle = (pos[0], pos[1], conf, source)
+            vy = 0.0
+            if self._traj:
+                lt, lx, ly = self._traj[-1]
+                gap = frame_idx - lt
+                if 0 < gap <= self._HIT_GAP_MAX:
+                    speed = float(np.hypot(pos[0] - lx, pos[1] - ly)) / gap
+                    vy = (pos[1] - ly) / gap
+            self._traj.append((frame_idx, pos[0], pos[1]))
+            self._last_det = (frame_idx, pos[0], pos[1], conf, source, vy)
 
-        # ── Net crossing → last_hitter_side (active in both states) ──────────
+        # ── Net crossing → last hitter is the side the shuttle came FROM ─────
         if pos is not None and self.court.H is not None:
             try:
                 court_x, _ = self.court.to_court(pos[0], pos[1])
@@ -180,243 +229,168 @@ class ScoringEngine:
                     l2r = self._prev_court_x < 0 and court_x > 0
                     r2l = self._prev_court_x > 0 and court_x < 0
                     if l2r or r2l:
-                        new_side = "LEFT" if l2r else "RIGHT"
-                        self.state.last_hitter_side = new_side
+                        self.state.last_hitter_side = "LEFT" if l2r else "RIGHT"
                         if self.state.rally_state == "SERVE_PENDING":
-                            # Shuttle already over the net — serve happened, rally active
-                            self.state.rally_state = "RALLY_ACTIVE"
-                            self._serve_candidate_side = None
-                            self._serve_still_count = 0
-                            print(f"  🏸 Rally active (net crossing) hitter={new_side}")
+                            # Shuttle already over the net — rally is on
+                            self._start_rally(frame_idx, announce="net crossing")
                 self._prev_court_x = court_x
             except Exception:
                 pass
 
-        # ── SERVE_PENDING: watch for serve launch ─────────────────────────────
+        # ── SERVE_PENDING: rally starts on sustained shuttle motion ──────────
         if self.state.rally_state == "SERVE_PENDING":
-            self._handle_serve_detection(pos)
+            if speed is not None and speed >= self._LAUNCH_SPEED:
+                self._launch_count += 1
+                if self._launch_count >= self._LAUNCH_FRAMES:
+                    self.state.last_hitter_side = self._court_side(pos)
+                    self._start_rally(frame_idx, announce=f"launch {speed:.1f}px/f")
+            elif pos is not None:
+                self._launch_count = 0
             return None
 
-        # ── RALLY_ACTIVE: confirmation window ────────────────────────────────
-        if self._pending_event is not None:
-            confirmed = self._tick_confirmation(pos, conf)
-            return confirmed
+        # ── RALLY_ACTIVE: hit detection ───────────────────────────────────────
+        if pos is not None:
+            self._detect_hit(frame_idx)
 
-        # ── RALLY_ACTIVE: new landing candidate ──────────────────────────────
-        det: Optional[RawDetection] = self.landing.update(pos, conf, source)
-        if det is None:
-            return None
+        # ── Rally end A: shuttle at rest low in the frame ─────────────────────
+        if pos is not None:
+            if speed is not None and speed < self._STILL_SPEED:
+                self._slow_count += 1
+            elif speed is not None:
+                self._slow_count = 0
+            if self._slow_count >= self._STILL_FRAMES and self._is_low(pos[1]):
+                return self._finish_rally(frame_idx, pos[0], pos[1], conf, source,
+                                          how="came to rest")
 
-        # Height gate: floor landings happen in the lower portion of the frame.
-        if self._frame_height is not None and det.y < self._FLOOR_HEIGHT_RATIO * self._frame_height:
-            return None
+        # ── Rally end B: vanished while descending near the floor ────────────
+        if pos is None and self._last_det is not None:
+            lf, lx, ly, lconf, lsrc, lvy = self._last_det
+            if (frame_idx - lf >= self._GONE_FRAMES
+                    and self._is_low(ly)
+                    and lvy >= 0):
+                return self._finish_rally(frame_idx, lx, ly, lconf, lsrc,
+                                          how="vanished while descending")
 
-        event = self._build_landing_event(frame, det, frame_idx)
-        self._pending_event    = event
-        self._pending_countdown = self._CONFIRM_WINDOW
-        self._pending_prev_pos  = (det.x, det.y)
+        # ── Rally end C: lost the shuttle entirely → abort, no point ─────────
+        last_f = self._last_det[0] if self._last_det else self._rally_start_frame
+        if frame_idx - last_f > self._ABORT_FRAMES:
+            print(f"  ⚠ [{frame_idx}] Rally aborted — shuttle lost for "
+                  f"{frame_idx - last_f} frames, no point awarded")
+            self._reset_rally()
+
         return None
 
     # ------------------------------------------------------------------
-    # Serve detection
+    # Rally state machine helpers
     # ------------------------------------------------------------------
 
-    def _handle_serve_detection(self, pos: Optional[tuple]):
+    def _is_low(self, py: float) -> bool:
+        """True if the pixel row is within the court's floor band."""
+        if self._floor_min_y is not None:
+            return py >= self._floor_min_y
+        return (self._frame_height is not None
+                and py > self._FLOOR_RATIO * self._frame_height)
+
+    def _court_side(self, pos) -> Optional[str]:
+        if self.court.H is None:
+            return None
+        try:
+            cx, _ = self.court.to_court(pos[0], pos[1])
+            return "LEFT" if cx < 0 else "RIGHT"
+        except Exception:
+            return None
+
+    def _start_rally(self, frame_idx: int, announce: str):
+        self.state.rally_state = "RALLY_ACTIVE"
+        self._rally_start_frame = frame_idx
+        self._launch_count = 0
+        self._slow_count = 0
+        print(f"  🏸 [{frame_idx}] Rally active ({announce}) "
+              f"hitter={self.state.last_hitter_side or '?'}")
+
+    def _detect_hit(self, frame_idx: int):
         """
-        Called each frame while in SERVE_PENDING.
-        Watches for the shuttle to be still near a player then launch.
-        Transitions to RALLY_ACTIVE and sets last_hitter_side on launch.
+        A hit is a sharp direction change between two consecutive trajectory
+        legs, both moving at racket speed. The court half where it happens
+        identifies the hitter.
         """
-        if pos is None:
+        if frame_idx - self._last_hit_frame <= self._HIT_COOLDOWN:
+            return
+        if len(self._traj) < 3:
+            return
+        (t0, x0, y0), (t1, x1, y1), (t2, x2, y2) = list(self._traj)[-3:]
+        if t1 - t0 > self._HIT_GAP_MAX or t2 - t1 > self._HIT_GAP_MAX:
             return
 
-        if self._pixel_speed < self._SERVE_LOW_SPEED:
-            self._serve_still_count += 1
-            if self._serve_still_count >= self._SERVE_STILL_FRAMES:
-                nearest = self._nearest_player_side(pos)
-                if nearest:
-                    self._serve_candidate_side = nearest
-        else:
-            # Shuttle is moving — if we had a still candidate, reset only if
-            # speed hasn't reached launch threshold yet
-            if self._serve_candidate_side is None:
-                self._serve_still_count = 0
+        v1 = np.array([(x1 - x0) / (t1 - t0), (y1 - y0) / (t1 - t0)])
+        v2 = np.array([(x2 - x1) / (t2 - t1), (y2 - y1) / (t2 - t1)])
+        s1, s2 = np.linalg.norm(v1), np.linalg.norm(v2)
+        if s1 < self._HIT_MIN_SPEED or s2 < self._HIT_MIN_SPEED:
+            return
+        if float(np.dot(v1, v2)) / (s1 * s2) >= self._HIT_MAX_COS:
+            return
 
-        if (self._serve_candidate_side is not None
-                and self._pixel_speed >= self._SERVE_LAUNCH_SPEED):
-            self.state.last_hitter_side = self._serve_candidate_side
-            self.state.rally_state = "RALLY_ACTIVE"
-            self._serve_candidate_side = None
-            self._serve_still_count = 0
-            self._prev_court_x = None
-            print(f"  🏸 Serve detected from {self.state.last_hitter_side} "
-                  f"(speed={self._pixel_speed:.1f}px/f)")
+        side = self._court_side((x1, y1))
+        if side is not None:
+            self.state.last_hitter_side = side
+            self._last_hit_frame = frame_idx
+            print(f"  🏓 [{frame_idx}] Hit by {side} "
+                  f"(turn {s1:.0f}→{s2:.0f}px/f)")
 
-    def _nearest_player_side(self, shuttle_pos: tuple) -> Optional[str]:
-        """Return which court side's player is closest to the shuttle pixel position."""
-        side_positions = self.players.get_side_positions()
-        if not side_positions:
+    def _finish_rally(self, frame_idx: int, px: float, py: float,
+                      conf: float, source: str, how: str) -> Optional[LandingEvent]:
+        if self.court.H is None:
+            self._reset_rally()
             return None
-        sx, sy = shuttle_pos
-        best_side, best_dist = None, float("inf")
-        for side, (px, py) in side_positions.items():
-            d = np.hypot(sx - px, sy - py)
-            if d < best_dist:
-                best_dist = d
-                best_side = side
-        return best_side
-
-    # ------------------------------------------------------------------
-    # Confirmation window
-    # ------------------------------------------------------------------
-
-    def _tick_confirmation(self, pos, conf) -> Optional[LandingEvent]:
-        """
-        Called every frame while a candidate is pending.
-        Returns the confirmed LandingEvent when the window expires, or None
-        if still waiting / cancelled.
-        """
-        self._pending_countdown -= 1
-
-        if pos is not None and conf > 0.25 and self._pending_prev_pos is not None:
-            px, py = self._pending_prev_pos
-            speed = np.hypot(pos[0] - px, pos[1] - py)
-            self._pending_prev_pos = pos
-
-            if speed > self._CANCEL_SPEED:
-                # Shuttle is still moving fast → this was a racket hit, not a landing
-                print(f"  ⚬ Candidate cancelled — shuttle still at {speed:.1f} px/frame")
-                self._pending_event    = None
-                self._pending_prev_pos = None
-                return None
-
-        elif pos is not None:
-            self._pending_prev_pos = pos
-
-        if self._pending_countdown <= 0:
-            # Window expired without cancellation → confirm as floor landing
-            event = self._pending_event
-            self._pending_event    = None
-            self._pending_prev_pos = None
-            self._confirm_landing(event)
-            return event
-
-        return None   # still watching
-
-    # ------------------------------------------------------------------
-    # Event building + scoring
-    # ------------------------------------------------------------------
-
-    def _build_landing_event(self, frame, det: RawDetection, frame_idx: int) -> LandingEvent:
-        """Compute court coords and IN/OUT verdict. Does NOT touch the score."""
-        cx, cy = self.court.to_court(det.x, det.y)
+        try:
+            cx, cy = self.court.to_court(px, py)
+        except Exception:
+            self._reset_rally()
+            return None
 
         event = LandingEvent(
             frame_idx=frame_idx,
-            pixel_x=det.x, pixel_y=det.y,
+            pixel_x=px, pixel_y=py,
             court_x=cx, court_y=cy,
-            confidence=det.conf,
-            source=det.source,
+            confidence=conf,
+            source=source,
         )
 
         dist = distance_to_boundary(cx, cy, self._zone_poly)
         event.near_line = abs(dist) < LINE_MARGIN
 
-        # Sanity guard: a real badminton shot can be at most ~50cm past the line.
-        # Anything further is a false detection in the crowd, ceiling, or net area —
-        # discard it rather than counting a bogus OUT.
-        MAX_PLAUSIBLE_OUT = 2.0   # metres
-        if dist < -(LINE_MARGIN + MAX_PLAUSIBLE_OUT):
-            event.verdict = Verdict.PENDING
-            event.reason  = (f"Discarded — {abs(dist)*100:.0f}cm outside boundary "
-                             f"(likely false detection in background)")
-            return event
-
-        if dist > LINE_MARGIN:
+        # Sanity guard: a real shot lands at most a short distance past the
+        # line. Far beyond that = false detection in the crowd/net/background.
+        if dist < -(LINE_MARGIN + self._MAX_PLAUSIBLE_OUT):
+            event.reason = (f"Discarded — {abs(dist)*100:.0f}cm outside boundary "
+                            f"(likely false detection), no point [{how}]")
+        elif dist >= 0:
             event.verdict = Verdict.IN
-            event.reason = f"Geometric IN: {dist*100:.1f}cm inside [{det.source} conf={det.conf:.2f}]"
-
-        elif dist < -LINE_MARGIN:
-            event.verdict = Verdict.OUT
-            event.reason = f"Geometric OUT: {abs(dist)*100:.1f}cm outside [{det.source} conf={det.conf:.2f}]"
-
+            event.reason = (f"IN: {dist*100:.1f}cm inside "
+                            f"[{how}, {source} conf={conf:.2f}]")
         else:
-            if self.gemma:
-                annotated = self._draw_court_overlay(frame.copy(), cx, cy, det.x, det.y)
-                result = self.gemma.judge(
-                    annotated, cx, cy,
-                    zone_name=f"{self.game_mode} court",
-                    distance_to_line=dist,
-                )
-                event.verdict  = Verdict(result.get("verdict", "OUT"))
-                event.gemma_used = True
-                event.reason = (
-                    f"Gemma4 [{det.source} conf={det.conf:.2f}]: "
-                    f"{result.get('reason', '')} "
-                    f"(gemma_conf={result.get('confidence', 0):.2f})"
-                )
-            else:
-                event.verdict = Verdict.IN if dist >= 0 else Verdict.OUT
-                event.reason  = f"Geometric fallback (no Gemma): dist={dist*100:.1f}cm"
+            event.verdict = Verdict.OUT
+            event.reason = (f"OUT: {abs(dist)*100:.1f}cm outside "
+                            f"[{how}, {source} conf={conf:.2f}]")
 
-        return event
-
-    def _confirm_landing(self, event: LandingEvent):
-        """Score the confirmed floor landing and append to history."""
         if event.verdict in (Verdict.IN, Verdict.OUT):
             self._update_score(event)
         self.state.history.append(event)
-        # Reset rally — wait for next serve
+        self._reset_rally()
+        self._cooldown = self._POINT_COOLDOWN
+        return event
+
+    def _reset_rally(self):
         self.state.rally_state = "SERVE_PENDING"
-        self._serve_candidate_side = None
-        self._serve_still_count = 0
+        self._traj.clear()
         self._prev_court_x = None
-        self._prev_pixel_pos = None
+        self._last_det = None
+        self._launch_count = 0
+        self._slow_count = 0
 
-    def draw_court_boundaries(self, frame: np.ndarray) -> np.ndarray:
-        """
-        Draw the detected court grid onto the frame and return the annotated
-        copy. Uses the canonical lines projected by court_mapping during
-        auto_calibrate(); returns the frame unchanged if not calibrated.
-        """
-        if not self._projected_lines:
-            return frame
-        return draw_court_overlay(frame, self._projected_lines, corners=None)
-
-    def _draw_court_overlay(
-            self, frame: np.ndarray,
-            court_x: float, court_y: float,
-            px: float, py: float,
-        ) -> np.ndarray:
-        """
-        Project the court boundary polygon back into pixel space and draw it
-        on a copy of the frame, plus mark the shuttle landing position.
-        This gives Gemma a visual reference for where the court lines are.
-        """
-        if self.court.H_inv is None:
-            return frame
-
-        # Project zone polygon corners court → pixel
-        corners = np.array(self._zone_poly, dtype=np.float32).reshape((-1, 1, 2))
-        pix_corners = cv2.perspectiveTransform(corners, self.court.H_inv)
-        pix_corners = pix_corners.reshape((-1, 2)).astype(np.int32)
-
-        # Draw court boundary in cyan
-        cv2.polylines(frame, [pix_corners], isClosed=True,
-                      color=(255, 255, 0), thickness=2)
-
-        # Mark shuttle landing position with a bright circle + crosshair
-        ipx, ipy = int(round(px)), int(round(py))
-        cv2.circle(frame, (ipx, ipy), 8,  (0, 0, 255), 2)
-        cv2.line(frame, (ipx - 12, ipy), (ipx + 12, ipy), (0, 0, 255), 1)
-        cv2.line(frame, (ipx, ipy - 12), (ipx, ipy + 12), (0, 0, 255), 1)
-
-        # Label with court coordinates
-        label = f"({court_x:.2f}m, {court_y:.2f}m)"
-        cv2.putText(frame, label, (ipx + 10, ipy - 10),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
-
-        return frame
+    # ------------------------------------------------------------------
+    # Scoring
+    # ------------------------------------------------------------------
 
     def _update_score(self, event: LandingEvent):
         _opp = {"LEFT": "RIGHT", "RIGHT": "LEFT"}
@@ -426,15 +400,16 @@ class ScoringEngine:
             # Shuttle landed in-bounds on landing_side's half → other player scored
             scorer_side = _opp[landing_side]
         else:
-            # OUT → the player who hit it out loses the point
-            if self.state.last_hitter_side is None:
-                print("  ⚠ OUT but last_hitter_side unknown — point skipped")
-                return
-            scorer_side = _opp[self.state.last_hitter_side]
+            # OUT → the player who hit it out loses the point. If we never saw
+            # the hitter, the shuttle still fell on landing_side's end of the
+            # court, so the hit came from the other side.
+            hitter = self.state.last_hitter_side or _opp[landing_side]
+            scorer_side = _opp[hitter]
 
         scorer = self.state.side_to_player[scorer_side]
         self.state.score[scorer] += 1
-        print(f"  ✓ Point → {scorer_side} side opponent (Player {scorer + 1}) | {event.verdict.value} on {landing_side} | score={self.state.score}")
+        print(f"  ✓ Point → {scorer_side} side (Player {scorer + 1}) | "
+              f"{event.verdict.value} on {landing_side} | score={self.state.score}")
         self._check_serve_change(scorer)
 
     def _check_serve_change(self, scorer: int):
@@ -451,3 +426,17 @@ class ScoringEngine:
         self.state.game += 1
         self.state.last_hitter_side = None
         self._prev_court_x = None
+
+    # ------------------------------------------------------------------
+    # Drawing
+    # ------------------------------------------------------------------
+
+    def draw_court_boundaries(self, frame: np.ndarray) -> np.ndarray:
+        """
+        Draw the detected court grid onto the frame and return the annotated
+        copy. Uses the canonical lines projected by court_mapping during
+        auto_calibrate(); returns the frame unchanged if not calibrated.
+        """
+        if not self._projected_lines:
+            return frame
+        return draw_court_overlay(frame, self._projected_lines, corners=None)

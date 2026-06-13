@@ -5,17 +5,17 @@ from pathlib import Path
 # Allow scoring_engine's internal imports (landing_detector, gemma_client, etc.)
 sys.path.insert(0, str(Path(__file__).parent / "llm"))
 
-from fastapi import FastAPI, UploadFile, File, HTTPException
+from fastapi import FastAPI, UploadFile, File, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse
 from fastapi.middleware.cors import CORSMiddleware
-from concurrent.futures import ThreadPoolExecutor
+from pydantic import BaseModel
 from typing import Dict, Any
 import cv2
 import uuid
 import asyncio
 import torch
 
-from llm.scoring_engine import ScoringEngine
+import session as sessions
 
 app = FastAPI()
 
@@ -33,102 +33,30 @@ print(f"Using device: {DEVICE}")
 OUTPUT_DIR = Path("outputs")
 OUTPUT_DIR.mkdir(exist_ok=True)
 
-YOLO_WEIGHTS     = "model2/runs/detect/yolo-runs/yolo_standard/weights/best.pt"
-OBB_WEIGHTS      = "model2/runs/obb/yolo-obb/yolo_obb/weights/best.pt"
-TRACKNET_WEIGHTS = "model2/runs/train-track/tracknet_best.pth"
+YOLO_WEIGHTS     = None
+OBB_WEIGHTS      = "model2/models/claudette_trained/yolo_obb_finetune/weights/best.pt"
+TRACKNET_WEIGHTS = "model2/models/claudette_trained/tracknetv2/tracknetv2_best.pth"
 
-jobs: Dict[str, Any] = {}
-_executor = ThreadPoolExecutor(max_workers=2)
+DETECT_STRIDE = int(os.environ.get("DETECT_STRIDE", "2"))
+
+# Videos uploaded but not yet processing: job_id -> {video_path, mode}
+uploads: Dict[str, Any] = {}
 
 
-def _run_pipeline(job_id: str, video_path: str, mode: str) -> None:
-    try:
-        jobs[job_id]["status"] = "calibrating"
+def _engine_kwargs(mode: str, detect_stride: int) -> dict:
+    return {
+        "yolo_weights": YOLO_WEIGHTS,
+        "obb_weights": OBB_WEIGHTS,
+        "tracknet_weights": TRACKNET_WEIGHTS,
+        "mode": mode,
+        "tracking_mode": "hybrid",
+        "conf_threshold": 0.25,
+        "device": DEVICE,
+        "detect_stride": detect_stride,
+    }
 
-        engine = ScoringEngine(
-            yolo_weights=YOLO_WEIGHTS,
-            obb_weights=OBB_WEIGHTS,
-            tracknet_weights=TRACKNET_WEIGHTS,
-            mode=mode,
-            tracking_mode="hybrid",
-            conf_threshold=0.25,
-            device=DEVICE,
-        )
 
-        engine.auto_calibrate(video_path, n_frames=60)
-
-        cap = cv2.VideoCapture(video_path)
-        if not cap.isOpened():
-            raise RuntimeError("Cannot open video file")
-
-        fps          = cap.get(cv2.CAP_PROP_FPS) or 30.0
-        width        = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-        height       = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-
-        output_path = str(OUTPUT_DIR / f"{job_id}_result.mp4")
-        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-        out = cv2.VideoWriter(output_path, fourcc, fps, (width, height))
-        if not out.isOpened():
-            cap.release()
-            raise RuntimeError("Cannot create output video writer")
-
-        jobs[job_id].update({
-            "status": "processing",
-            "total_frames": total_frames,
-            "frame": 0,
-            "progress_percent": 0.0,
-            "score": [0, 0],
-        })
-
-        landing_events = []
-        frame_idx = 0
-
-        while True:
-            ret, frame = cap.read()
-            if not ret:
-                break
-
-            event = engine.process_frame(frame, frame_idx)
-            if event is not None:
-                landing_events.append({
-                    "frame": event.frame_idx,
-                    "verdict": event.verdict.value,
-                    "court_x": round(event.court_x, 3),
-                    "court_y": round(event.court_y, 3),
-                    "confidence": round(event.confidence, 3),
-                    "source": event.source,
-                    "reason": event.reason,
-                })
-
-            frame = engine.draw_court_boundaries(frame)
-            out.write(frame)
-
-            frame_idx += 1
-            jobs[job_id]["frame"] = frame_idx
-            jobs[job_id]["progress_percent"] = round(frame_idx / total_frames * 100, 1) if total_frames else 0
-            jobs[job_id]["score"] = list(engine.state.score)
-            jobs[job_id]["rally_state"] = engine.state.rally_state
-            jobs[job_id]["last_hitter_side"] = engine.state.last_hitter_side
-
-        cap.release()
-        out.release()
-        os.remove(video_path)
-
-        jobs[job_id].update({
-            "status": "complete",
-            "output_video": output_path,
-            "score": list(engine.state.score),
-            "game": engine.state.game,
-            "landing_events": landing_events,
-            "total_landings": len(landing_events),
-        })
-
-    except Exception as exc:
-        print(f"[pipeline error] job={job_id}: {exc}")
-        jobs[job_id]["status"] = "error"
-        jobs[job_id]["message"] = str(exc)
-
+# ── Recorded video upload (single-chunk session) ─────────────────────────────
 
 @app.post("/upload-video")
 async def upload_video(file: UploadFile = File(...), mode: str = "singles"):
@@ -143,35 +71,41 @@ async def upload_video(file: UploadFile = File(...), mode: str = "singles"):
     with open(video_path, "wb") as f:
         f.write(contents)
 
-    jobs[job_id] = {
-        "status": "uploaded",
-        "video_path": video_path,
-        "mode": mode,
-        "frame": 0,
-        "total_frames": 0,
-        "progress_percent": 0.0,
-        "score": [0, 0],
-    }
-
+    uploads[job_id] = {"video_path": video_path, "mode": mode}
     return {"job_id": job_id, "status": "uploaded"}
 
 
 @app.post("/process-video/{job_id}")
 async def process_video(job_id: str):
     """Step 2: Start the analysis pipeline for an uploaded video."""
-    if job_id not in jobs:
+    if job_id not in uploads:
         raise HTTPException(status_code=404, detail="Job not found")
-    if jobs[job_id]["status"] not in ("uploaded", "error"):
+    if sessions.get_session(job_id) is not None:
+        raise HTTPException(status_code=400, detail="Job is already processing")
+    if sessions.active_sessions() >= 1:
         raise HTTPException(
-            status_code=400,
-            detail=f"Job is already '{jobs[job_id]['status']}' — cannot start processing",
+            status_code=409,
+            detail="Another session is processing; try again when it finishes",
         )
 
-    video_path = jobs[job_id]["video_path"]
-    mode       = jobs[job_id].get("mode", "singles")
+    info = uploads.pop(job_id)
+    video_path = info["video_path"]
 
-    loop = asyncio.get_event_loop()
-    loop.run_in_executor(_executor, _run_pipeline, job_id, video_path, mode)
+    cap = cv2.VideoCapture(video_path)
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    cap.release()
+
+    s = sessions.create_session(
+        job_id,
+        engine_kwargs=_engine_kwargs(info["mode"], DETECT_STRIDE),
+        output_dir=OUTPUT_DIR,
+        annotate=True,
+        live=False,
+        loop=asyncio.get_running_loop(),
+    )
+    s.expected_total_frames = total_frames
+    s.add_chunk(0, video_path)
+    s.finish()
 
     return {"job_id": job_id, "status": "processing"}
 
@@ -179,34 +113,132 @@ async def process_video(job_id: str):
 @app.get("/job-status/{job_id}")
 async def job_status(job_id: str):
     """Poll for live progress: status, frame count, score, progress %."""
-    if job_id not in jobs:
+    if job_id in uploads:
+        return {"status": "uploaded", "frame": 0, "total_frames": 0,
+                "progress_percent": 0.0, "score": [0, 0]}
+    s = sessions.get_session(job_id)
+    if s is None:
         raise HTTPException(status_code=404, detail="Job not found")
-    return jobs[job_id]
+    return s.latest_state
 
 
 @app.get("/results/{job_id}")
 async def get_results(job_id: str):
     """Fetch the full results once processing is complete."""
-    if job_id not in jobs:
+    s = sessions.get_session(job_id)
+    if s is None:
         raise HTTPException(status_code=404, detail="Job not found")
-    if jobs[job_id]["status"] != "complete":
+    if s.latest_state["status"] != "complete":
         raise HTTPException(
             status_code=400,
-            detail=f"Job not complete (current status: {jobs[job_id]['status']})",
+            detail=f"Job not complete (current status: {s.latest_state['status']})",
         )
-    return jobs[job_id]
+    return s.latest_state
 
 
 @app.get("/download/{job_id}")
 async def download_video(job_id: str):
     """Download the annotated output video."""
-    if job_id not in jobs:
+    s = sessions.get_session(job_id)
+    if s is None:
         raise HTTPException(status_code=404, detail="Job not found")
-    path = jobs[job_id].get("output_video")
-    if not path or not os.path.exists(path):
+    path = s.output_path
+    if not path or not os.path.exists(path) or s.latest_state["status"] != "complete":
         raise HTTPException(status_code=404, detail="Output video not ready")
     return FileResponse(
         path,
         media_type="video/mp4",
         filename=f"badminton_{job_id[:8]}_result.mp4",
     )
+
+
+# ── Live mode (chunked session fed by the phone camera) ──────────────────────
+
+class LiveStartRequest(BaseModel):
+    mode: str = "singles"
+    annotate: bool = False
+    detect_stride: int = DETECT_STRIDE
+
+
+@app.post("/live/start")
+async def live_start(req: LiveStartRequest):
+    if sessions.active_live_sessions() >= 1:
+        raise HTTPException(status_code=409, detail="A live session is already active")
+    if sessions.active_sessions() >= 1:
+        raise HTTPException(
+            status_code=409,
+            detail="An upload is processing; try again when it finishes",
+        )
+
+    session_id = str(uuid.uuid4())
+    (OUTPUT_DIR / session_id).mkdir(exist_ok=True)
+
+    sessions.create_session(
+        session_id,
+        engine_kwargs=_engine_kwargs(req.mode, max(1, req.detect_stride)),
+        output_dir=OUTPUT_DIR,
+        annotate=req.annotate,
+        live=True,
+        loop=asyncio.get_running_loop(),
+    )
+    return {"session_id": session_id}
+
+
+@app.post("/live/chunk/{session_id}")
+async def live_chunk(session_id: str, seq: int, file: UploadFile = File(...)):
+    s = sessions.get_session(session_id)
+    if s is None:
+        raise HTTPException(status_code=404, detail="Session not found")
+    if s.finished:
+        raise HTTPException(status_code=400, detail="Session already finished")
+
+    chunk_path = str(OUTPUT_DIR / session_id / f"chunk_{seq:05d}.mp4")
+    contents = await file.read()
+    with open(chunk_path, "wb") as f:
+        f.write(contents)
+
+    backlog = s.add_chunk(seq, chunk_path)
+    return {"queued": True, "backlog": backlog}
+
+
+@app.post("/live/finish/{session_id}")
+async def live_finish(session_id: str):
+    s = sessions.get_session(session_id)
+    if s is None:
+        raise HTTPException(status_code=404, detail="Session not found")
+    s.finish()
+    return s.latest_state
+
+
+@app.get("/live/status/{session_id}")
+async def live_status(session_id: str):
+    s = sessions.get_session(session_id)
+    if s is None:
+        raise HTTPException(status_code=404, detail="Session not found")
+    return s.latest_state
+
+
+@app.websocket("/live/ws/{session_id}")
+async def live_ws(websocket: WebSocket, session_id: str):
+    s = sessions.get_session(session_id)
+    if s is None:
+        await websocket.close(code=4004)
+        return
+    await websocket.accept()
+    q = s.subscribe()
+    try:
+        await websocket.send_json(s.latest_state)
+        while True:
+            state = await q.get()
+            await websocket.send_json(state)
+            if state["status"] in ("complete", "error"):
+                break
+    except WebSocketDisconnect:
+        pass
+    finally:
+        s.unsubscribe(q)
+
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run("main:app", host="0.0.0.0", port=int(os.environ.get("PORT", "4000")))

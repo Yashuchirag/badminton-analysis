@@ -1,21 +1,17 @@
 # pyrefly: ignore [missing-import]
 import cv2
-import sys, os
+import sys, os, time
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-from gemma_client import LineJudge
 from scoring_engine import ScoringEngine
 
 # ── Video to process ──────────────────────────────────────────────────────────
-VIDEO_PATH = "model2/dataset/TrackNetV2_Dataset/Professional/match2/video/merged_20260520_174554.mp4"
-OUTPUT_PATH = "scored_output_1.mp4"
-
-judge = LineJudge(model="gemma4:e4b")
+VIDEO_PATH = "model2/dataset/TrackNetV2_Dataset/Professional/match3/video/merged_20260520_174744.mp4"
+OUTPUT_PATH = "scored_output_3.mp4"
 
 engine = ScoringEngine(
     obb_weights="model2/models/claudette_trained/yolo_obb_finetune/weights/best.pt",
     tracknet_weights="model2/models/claudette_trained/tracknetv2/tracknetv2_best.pth",
-    gemma=judge,
     mode="singles",
     tracking_mode="hybrid",
     device="0",
@@ -39,13 +35,20 @@ height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
 fourcc = cv2.VideoWriter_fourcc(*"mp4v")
 out    = cv2.VideoWriter(OUTPUT_PATH, fourcc, fps, (width, height))
 
+total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
 frame_idx = 0
+t_start = time.time()
 
 try:
     while True:
         ret, frame = cap.read()
         if not ret:
             break
+
+        if frame_idx > 0 and frame_idx % 100 == 0:
+            elapsed = time.time() - t_start
+            print(f"[{frame_idx}/{total_frames}] {frame_idx / elapsed:.1f} fps | "
+                  f"score={engine.state.score} | {engine.state.rally_state}")
 
         landing = engine.process_frame(frame, frame_idx)
         score   = engine.state.score
