@@ -7,46 +7,28 @@ import {
   ScrollView,
   Alert,
   Text,
-  Dimensions,
-  Animated
+  Animated,
 } from 'react-native';
 import * as ImagePicker from 'expo-image-picker';
-import { Image } from 'expo-image';
 import { Video, ResizeMode } from 'expo-av';
+import { SafeAreaView } from 'react-native-safe-area-context';
+import { Ionicons } from '@expo/vector-icons';
+import { useRouter } from 'expo-router';
 
-
-import { ThemedView } from '@/components/themed-view';
-import { ThemedText } from '@/components/themed-text';
-
-const { width } = Dimensions.get('window');
-
-interface StreamUpdate {
-  type: 'started' | 'progress' | 'complete' | 'error';
-  frame?: number;
-  total_frames?: number;
-  progress_percent?: number;
-  people_count?: number;
-  unique_people?: number;
-  shuttle_detected?: boolean;
-  shuttle_position?: [number, number] | null;
-  preview_image?: string;
-  output_video?: string;
-  message?: string;
-}
+import { API_BASE } from '@/lib/config';
+import { colors, fonts, spacing } from '@/lib/theme';
+import ShuttleBackground from '@/components/ShuttleBackground';
 
 export default function HomeScreen() {
+  const router = useRouter();
   const [videoUri, setVideoUri] = useState<string | null>(null);
   const [processing, setProcessing] = useState(false);
   const [jobId, setJobId] = useState<string | null>(null);
   const [currentFrame, setCurrentFrame] = useState(0);
   const [totalFrames, setTotalFrames] = useState(0);
   const [progress, setProgress] = useState(0);
-  const [previewImage, setPreviewImage] = useState<string | null>(null);
-  const [liveStats, setLiveStats] = useState({
-    people: 0,
-    uniquePeople: 0,
-    shuttleDetected: false
-  });
+  const [score, setScore] = useState<[number, number]>([0, 0]);
+  const [rallyState, setRallyState] = useState<string>('');
   const [finalResult, setFinalResult] = useState<any>(null);
   const [error, setError] = useState<string | null>(null);
 
@@ -57,17 +39,19 @@ export default function HomeScreen() {
     if (jobId && processing) {
       pollingInterval.current = setInterval(async () => {
         try {
-          const response = await fetch(`http://192.168.68.73:8000/job-status/${jobId}`);
+          const response = await fetch(`${API_BASE}/job-status/${jobId}`);
           const data = await response.json();
 
-          if (data.status === 'processing') {
+          if (data.status === 'processing' || data.status === 'calibrating') {
             updateProgress(data);
           } else if (data.status === 'complete') {
             handleComplete(data);
             stopPolling();
+            setProcessing(false);
           } else if (data.status === 'error') {
             setError(data.message || 'Processing failed');
             stopPolling();
+            setProcessing(false);
           }
         } catch (err) {
           console.error('Polling error:', err);
@@ -90,28 +74,26 @@ export default function HomeScreen() {
     setTotalFrames(data.total_frames || 0);
     setProgress(data.progress_percent || 0);
 
-    if (data.preview_image) {
-      setPreviewImage(data.preview_image);
+    if (Array.isArray(data.score)) {
+      setScore([data.score[0] || 0, data.score[1] || 0]);
     }
-
-    setLiveStats({
-      people: data.people_count || 0,
-      uniquePeople: data.unique_people || 0,
-      shuttleDetected: data.shuttle_detected || false
-    });
+    setRallyState(data.rally_state || '');
 
     Animated.timing(progressAnim, {
       toValue: data.progress_percent || 0,
       duration: 300,
-      useNativeDriver: false
+      useNativeDriver: false,
     }).start();
   };
 
   const handleComplete = (data: any) => {
     setFinalResult(data);
+    if (Array.isArray(data.score)) {
+      setScore([data.score[0] || 0, data.score[1] || 0]);
+    }
     Alert.alert(
-      'Processing Complete! 🎉',
-      `Detected ${data.unique_people} players\nShuttle detected in ${data.summary?.detection_rate}% of frames`,
+      'Processing Complete',
+      `Final score: ${data.score?.[0] ?? 0} - ${data.score?.[1] ?? 0}\nLandings detected: ${data.total_landings ?? 0}`,
       [{ text: 'OK' }]
     );
   };
@@ -155,13 +137,13 @@ export default function HomeScreen() {
   const resetState = () => {
     stopPolling();
     setJobId(null);
-    setPreviewImage(null);
     setFinalResult(null);
     setError(null);
     setCurrentFrame(0);
     setTotalFrames(0);
     setProgress(0);
-    setLiveStats({ people: 0, uniquePeople: 0, shuttleDetected: false });
+    setScore([0, 0]);
+    setRallyState('');
     progressAnim.setValue(0);
   };
 
@@ -187,7 +169,7 @@ export default function HomeScreen() {
     } as any);
 
     try {
-      const response = await fetch('http://192.168.68.73:8000/track-human-video-async', {
+      const uploadResponse = await fetch(`${API_BASE}/upload-video`, {
         method: 'POST',
         body: formData,
         headers: {
@@ -195,17 +177,18 @@ export default function HomeScreen() {
         },
       });
 
-      if (!response.ok) throw new Error('Server error');
+      if (!uploadResponse.ok) throw new Error('Upload failed');
 
-      const data = await response.json();
+      const uploadData = await uploadResponse.json();
+      if (!uploadData.job_id) throw new Error('No job ID received');
 
-      if (data.job_id) {
-        setJobId(data.job_id);
-        setTotalFrames(data.total_frames || 0);
-      } else {
-        throw new Error('No job ID received');
-      }
+      const processResponse = await fetch(`${API_BASE}/process-video/${uploadData.job_id}`, {
+        method: 'POST',
+      });
 
+      if (!processResponse.ok) throw new Error('Could not start processing');
+
+      setJobId(uploadData.job_id);
     } catch (err) {
       setError('Upload failed. Please check server or network.');
       console.error(err);
@@ -213,262 +196,277 @@ export default function HomeScreen() {
     }
   };
 
-  const downloadVideo = async () => {
-    if (!finalResult?.output_video) return;
-
-    try {
-      const url = `http://192.168.68.73:8000/download-video?path=${encodeURIComponent(finalResult.output_video)}`;
-      Alert.alert('Download Ready', `Video URL: ${url}`, [
-        { text: 'OK' }
-      ]);
-      // In production, use expo-file-system to download and save
-    } catch (err) {
-      console.error('Download failed:', err);
-    }
-  };
-
+  const jobActive = processing || finalResult !== null;
 
   return (
-    <ScrollView contentContainerStyle={styles.scroll}>
-      <ThemedView style={styles.container}>
-        <ThemedText type="title" style={styles.title}>
-          🏸 Live Badminton Tracker
-        </ThemedText>
+    <View style={styles.root}>
+      <ShuttleBackground>
+      <SafeAreaView style={styles.safe} edges={['top', 'bottom']}>
+        <ScrollView contentContainerStyle={styles.scroll} showsVerticalScrollIndicator={false}>
 
-        <ThemedText style={styles.subtitle}>
-          Real-time player, wrist, and shuttle tracking
-        </ThemedText>
+          {/* Header */}
+          <View style={styles.header}>
+            <Text style={styles.title}>Game Tracker</Text>
+          </View>
 
-        {/* Video Selector */}
-        <TouchableOpacity
-          style={styles.videoCard}
-          onPress={chooseVideoSource}
-          activeOpacity={0.85}
-          disabled={processing}
-        >
-          {videoUri && !processing ? (
-            <Video
-              source={{ uri: videoUri }}
-              style={styles.video}
-              useNativeControls
-              isLooping
-              resizeMode={ResizeMode.CONTAIN}
-            />
-          ) : previewImage ? (
-            <Image
-              source={{ uri: previewImage }}
-              style={styles.video}
-              contentFit="contain"
-            />
-          ) : (
-            <View style={styles.placeholder}>
-              <Text style={styles.placeholderIcon}>📹</Text>
-              <ThemedText style={styles.placeholderText}>
-                {processing ? 'Processing...' : 'Tap to select video'}
-              </ThemedText>
+          {/* Action card */}
+          <View style={styles.glassCard}>
+            <View style={styles.tileRow}>
+              <TouchableOpacity
+                style={[styles.tile, videoUri && !processing ? styles.tileSelected : null]}
+                onPress={chooseVideoSource}
+                activeOpacity={0.8}
+                disabled={processing}
+              >
+                <Ionicons name="cloud-upload-outline" size={26} color={colors.accent} />
+                <Text style={styles.tileLabel}>Analyze video</Text>
+              </TouchableOpacity>
+
+              <TouchableOpacity
+                style={[styles.tile, styles.tileLive]}
+                onPress={() => router.push('/live')}
+                activeOpacity={0.8}
+                disabled={processing}
+              >
+                <Ionicons name="radio-outline" size={26} color={colors.accent} />
+                <Text style={[styles.tileLabel, { color: colors.accent }]}>Go live</Text>
+              </TouchableOpacity>
+            </View>
+          </View>
+
+          {/* Video preview */}
+          {videoUri && !processing && (
+            <TouchableOpacity
+              style={styles.glassCard}
+              onPress={chooseVideoSource}
+              activeOpacity={0.85}
+            >
+              <Video
+                source={{ uri: videoUri }}
+                style={styles.video}
+                useNativeControls
+                isLooping
+                resizeMode={ResizeMode.CONTAIN}
+              />
+            </TouchableOpacity>
+          )}
+
+          {/* Start analysis button */}
+          {videoUri && !processing && !finalResult && (
+            <TouchableOpacity
+              style={styles.ctaButton}
+              onPress={uploadAndProcessVideo}
+              activeOpacity={0.85}
+            >
+              <Ionicons name="play" size={20} color={colors.ctaText} />
+              <Text style={styles.ctaText}>Start Analysis</Text>
+            </TouchableOpacity>
+          )}
+
+          {/* Status card */}
+          {jobActive && (
+            <View style={styles.glassCard}>
+              <View style={styles.scoreRow}>
+                <View style={styles.scoreChip}>
+                  <Text style={styles.scoreDigit}>{score[0]}</Text>
+                </View>
+                <View style={styles.scoreChip}>
+                  <Text style={styles.scoreDigit}>{score[1]}</Text>
+                </View>
+              </View>
+
+              {processing && (
+                <>
+                  <View style={styles.progressTrack}>
+                    <Animated.View
+                      style={[
+                        styles.progressFill,
+                        {
+                          width: progressAnim.interpolate({
+                            inputRange: [0, 100],
+                            outputRange: ['0%', '100%'],
+                          }),
+                        },
+                      ]}
+                    />
+                  </View>
+                  <Text style={styles.monoLabel}>
+                    {rallyState
+                      ? rallyState === 'RALLY_ACTIVE'
+                        ? 'RALLY IN PLAY'
+                        : 'WAITING FOR SERVE'
+                      : `${currentFrame} / ${totalFrames} FRAMES · ${progress.toFixed(0)}%`}
+                  </Text>
+                  <ActivityIndicator color={colors.accent} size="small" style={{ marginTop: 8 }} />
+                </>
+              )}
+
+              {finalResult && (
+                <>
+                  <Text style={styles.monoLabel}>
+                    {finalResult.total_landings ?? 0} LANDINGS DETECTED
+                  </Text>
+                  <Video
+                    source={{ uri: `${API_BASE}/download/${jobId}` }}
+                    style={styles.resultsVideo}
+                    useNativeControls
+                    isLooping
+                    resizeMode={ResizeMode.CONTAIN}
+                  />
+                </>
+              )}
             </View>
           )}
-        </TouchableOpacity>
 
-        {/* Processing Status */}
-        {processing && (
-          <View style={styles.statusCard}>
-            <View style={styles.statusHeader}>
-              <ActivityIndicator color="#3B82F6" size="small" />
-              <ThemedText style={styles.statusTitle}>Processing Video</ThemedText>
+          {/* Error */}
+          {error && (
+            <View style={styles.errorCard}>
+              <Ionicons name="warning-outline" size={20} color={colors.destructive} />
+              <Text style={styles.errorText}>{error}</Text>
             </View>
+          )}
 
-            {/* Progress Bar */}
-            <View style={styles.progressBarContainer}>
-              <Animated.View
-                style={[
-                  styles.progressBarFill,
-                  {
-                    width: progressAnim.interpolate({
-                      inputRange: [0, 100],
-                      outputRange: ['0%', '100%']
-                    })
-                  }
-                ]}
-              />
-            </View>
-
-            <ThemedText style={styles.progressText}>
-              {currentFrame} / {totalFrames} frames ({progress.toFixed(1)}%)
-            </ThemedText>
-          </View>
-        )}
-
-        {/* Upload Button */}
-        <TouchableOpacity
-          style={[styles.uploadButton, (!videoUri || processing) && styles.disabledButton]}
-          onPress={uploadAndProcessVideo}
-          disabled={!videoUri || processing}
-        >
-          <ThemedText style={styles.uploadText}>
-            {processing ? '⏳ Processing...' : '🚀 Start Analysis'}
-          </ThemedText>
-        </TouchableOpacity>
-
-        {/* Error */}
-        {error && (
-          <View style={styles.errorCard}>
-            <Text style={styles.errorIcon}>⚠️</Text>
-            <ThemedText style={styles.errorText}>{error}</ThemedText>
-          </View>
-        )}
-
-        {/* Final Results */}
-        {finalResult && (
-          <View style={styles.resultsContainer}>
-            <ThemedText type="subtitle" style={styles.sectionTitle}>
-              📊 Tracked Results
-            </ThemedText>
-
-            {/* Download Button */}
-            <Video
-              source={{ uri: 'http://192.168.68.73:8000/track-human-video-async' }}
-              style={{ width: '100%', height: 300 }}
-              useNativeControls
-              isLooping
-              resizeMode={ResizeMode.CONTAIN}
-            />
-          </View>
-        )}
-      </ThemedView>
-    </ScrollView>
+        </ScrollView>
+      </SafeAreaView>
+      </ShuttleBackground>
+    </View>
   );
 }
 
+const GLASS = {
+  backgroundColor: colors.surface,
+  borderWidth: 1,
+  borderColor: colors.surfaceBorder,
+  borderRadius: 18,
+};
+
 const styles = StyleSheet.create({
-  scroll: { flexGrow: 1 },
-  container: { flex: 1, padding: 20 },
-  title: { textAlign: 'center', marginBottom: 4, fontSize: 28 },
-  subtitle: { textAlign: 'center', opacity: 0.7, marginBottom: 24, fontSize: 14 },
-  videoCard: {
-    height: 260,
-    borderRadius: 16,
-    backgroundColor: '#1E293B',
-    justifyContent: 'center',
-    alignItems: 'center',
-    marginBottom: 16,
+  root: { flex: 1, backgroundColor: colors.background },
+  safe: { flex: 1 },
+  scroll: { padding: spacing(2.5), paddingBottom: spacing(5) },
+
+  header: { marginBottom: spacing(3) },
+  title: {
+    fontFamily: fonts.heading,
+    fontSize: 32,
+    color: colors.textPrimary,
+    letterSpacing: 0.5,
+  },
+
+  glassCard: {
+    ...GLASS,
+    marginBottom: spacing(2),
     overflow: 'hidden',
-    borderWidth: 2,
-    borderColor: '#334155',
   },
-  video: { width: '100%', height: '100%' },
-  placeholder: { alignItems: 'center' },
-  placeholderIcon: { fontSize: 48, marginBottom: 12 },
-  placeholderText: { opacity: 0.6, fontSize: 14 },
-  statusCard: {
-    padding: 16,
-    borderRadius: 12,
-    backgroundColor: '#0F172A',
-    borderWidth: 1,
-    borderColor: '#334155',
-    marginBottom: 16,
-  },
-  statusHeader: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    gap: 12,
-    marginBottom: 12,
-  },
-  statusTitle: { fontSize: 16, fontWeight: '600' },
-  progressBarContainer: {
-    height: 8,
-    backgroundColor: '#1E293B',
-    borderRadius: 4,
-    overflow: 'hidden',
-    marginBottom: 8,
-  },
-  progressBarFill: {
-    height: '100%',
-    backgroundColor: '#3B82F6',
-    borderRadius: 4,
-  },
-  progressText: {
-    fontSize: 12,
-    textAlign: 'center',
-    opacity: 0.7,
-    marginBottom: 16,
-  },
-  liveStatsGrid: {
-    flexDirection: 'row',
-    gap: 12,
-  },
-  liveStatBox: {
+  tileRow: { flexDirection: 'row', gap: 1 },
+  tile: {
     flex: 1,
+    paddingVertical: spacing(2.5),
+    paddingHorizontal: spacing(2),
     alignItems: 'center',
-    padding: 12,
-    backgroundColor: '#1E293B',
-    borderRadius: 8,
+    gap: spacing(1),
   },
-  statIcon: { fontSize: 24, marginBottom: 4 },
-  liveStatValue: {
-    fontSize: 20,
-    fontWeight: '700',
-    color: '#38BDF8',
+  tileSelected: { backgroundColor: colors.accentDim },
+  tileLive: {
+    backgroundColor: colors.accentDim,
+    borderLeftWidth: 1,
+    borderLeftColor: colors.surfaceBorder,
   },
-  liveStatLabel: {
-    fontSize: 10,
-    opacity: 0.6,
-    marginTop: 2,
+  tileLabel: {
+    fontFamily: fonts.bodyMedium,
+    fontSize: 13,
+    color: colors.textPrimary,
+    textAlign: 'center',
   },
-  uploadButton: {
+
+  video: { width: '100%', height: 220 },
+
+  ctaButton: {
+    flexDirection: 'row',
     height: 56,
     borderRadius: 14,
-    backgroundColor: '#2563EB',
+    backgroundColor: colors.ctaBackground,
+    borderWidth: 1,
+    borderColor: colors.ctaBorder,
     justifyContent: 'center',
     alignItems: 'center',
-    marginBottom: 16,
+    gap: spacing(1),
+    marginBottom: spacing(2),
   },
-  disabledButton: { backgroundColor: '#64748B' },
-  uploadText: { color: '#fff', fontWeight: '700', fontSize: 16 },
+  ctaText: {
+    fontFamily: fonts.bodyBold,
+    fontSize: 17,
+    color: colors.ctaText,
+  },
+
+  scoreRow: {
+    flexDirection: 'row',
+    justifyContent: 'center',
+    gap: spacing(1.5),
+    paddingTop: spacing(2),
+    paddingHorizontal: spacing(2),
+  },
+  scoreChip: {
+    backgroundColor: colors.accentDim,
+    borderWidth: 1,
+    borderColor: colors.accentBorder,
+    borderRadius: 14,
+    paddingHorizontal: spacing(3),
+    paddingVertical: spacing(0.5),
+  },
+  scoreDigit: {
+    fontFamily: fonts.heading,
+    fontSize: 36,
+    color: colors.accent,
+    fontVariant: ['tabular-nums'],
+  },
+
+  progressTrack: {
+    height: 4,
+    backgroundColor: colors.accentDim,
+    borderRadius: 2,
+    overflow: 'hidden',
+    marginHorizontal: spacing(2),
+    marginTop: spacing(1.5),
+  },
+  progressFill: {
+    height: '100%',
+    backgroundColor: colors.accent,
+    borderRadius: 2,
+  },
+
+  monoLabel: {
+    fontFamily: fonts.mono,
+    fontSize: 10,
+    color: colors.textMuted,
+    letterSpacing: 2,
+    textAlign: 'center',
+    marginVertical: spacing(1),
+    paddingHorizontal: spacing(2),
+  },
+
+  resultsVideo: {
+    width: '100%',
+    height: 260,
+    borderRadius: 12,
+    marginTop: spacing(1),
+  },
+
   errorCard: {
     flexDirection: 'row',
     alignItems: 'center',
-    padding: 16,
-    borderRadius: 12,
-    backgroundColor: '#7F1D1D',
+    gap: spacing(1.5),
+    backgroundColor: 'rgba(220,38,38,0.12)',
     borderWidth: 1,
-    borderColor: '#DC2626',
-    marginBottom: 16,
-    gap: 12,
+    borderColor: colors.destructive,
+    borderRadius: 12,
+    padding: spacing(2),
+    marginBottom: spacing(2),
   },
-  errorIcon: { fontSize: 24 },
-  errorText: { color: '#FCA5A5', flex: 1 },
-  resultsContainer: { marginTop: 8 },
-  sectionTitle: { marginBottom: 16, fontWeight: '700', fontSize: 20 },
-  statsGrid: {
-    flexDirection: 'row',
-    flexWrap: 'wrap',
-    gap: 12,
-    marginBottom: 16,
-  },
-  statCard: {
+  errorText: {
+    fontFamily: fonts.body,
+    fontSize: 14,
+    color: colors.destructive,
     flex: 1,
-    minWidth: (width - 56) / 2,
-    padding: 16,
-    borderRadius: 12,
-    backgroundColor: '#0F172A',
-    borderWidth: 1,
-    borderColor: '#334155',
-    borderLeftWidth: 4,
   },
-  statLabel: { fontSize: 12, opacity: 0.7, marginBottom: 4 },
-  statValue: { fontSize: 24, fontWeight: '700', color: '#38BDF8' },
-  downloadButton: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    justifyContent: 'center',
-    padding: 16,
-    borderRadius: 12,
-    backgroundColor: '#065F46',
-    borderWidth: 1,
-    borderColor: '#10B981',
-    gap: 12,
-  },
-  downloadIcon: { fontSize: 24 },
-  downloadText: { color: '#D1FAE5', fontWeight: '600', fontSize: 14 },
 });

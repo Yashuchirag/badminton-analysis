@@ -26,6 +26,7 @@
       "predictiveBackGestureEnabled": false,
       "permissions": [
         "CAMERA",
+        "RECORD_AUDIO",
         "MEDIA_LIBRARY"
       ]
     },
@@ -35,6 +36,13 @@
     },
     "plugins": [
       "expo-router",
+      [
+        "expo-camera",
+        {
+          "cameraPermission": "This app uses the camera for live badminton scoring.",
+          "microphonePermission": "Microphone access is required to record video segments."
+        }
+      ],
       [
         "expo-splash-screen",
         {
@@ -46,7 +54,9 @@
             "backgroundColor": "#000000"
           }
         }
-      ]
+      ],
+      "expo-font",
+      "expo-web-browser"
     ],
     "experiments": {
       "typedRoutes": true,
