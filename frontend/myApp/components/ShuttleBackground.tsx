@@ -173,8 +173,27 @@ export default function ShuttleBackground({ children }: { children?: React.React
       touchY.value = NO_TOUCH;
     });
 
+  const hover = Gesture.Hover()
+    .onBegin((e) => {
+      'worklet';
+      touchX.value = e.absoluteX;
+      touchY.value = e.absoluteY;
+    })
+    .onUpdate((e) => {
+      'worklet';
+      touchX.value = e.absoluteX;
+      touchY.value = e.absoluteY;
+    })
+    .onEnd(() => {
+      'worklet';
+      touchX.value = NO_TOUCH;
+      touchY.value = NO_TOUCH;
+    });
+
+  const gesture = Gesture.Simultaneous(pan, hover);
+
   return (
-    <GestureDetector gesture={pan}>
+    <GestureDetector gesture={gesture}>
       <Animated.View style={StyleSheet.absoluteFill}>
         <Svg style={StyleSheet.absoluteFill} width={W} height={H}>
           <Defs>

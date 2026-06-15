@@ -252,14 +252,14 @@ export default function HomeScreen() {
           )}
 
           {/* Start analysis button */}
-          {videoUri && !processing && !finalResult && (
+          {!processing && !finalResult && (
             <TouchableOpacity
-              style={styles.ctaButton}
-              onPress={uploadAndProcessVideo}
-              activeOpacity={0.85}
+              style={[styles.ctaButton, !videoUri && styles.ctaButtonDisabled]}
+              onPress={videoUri ? uploadAndProcessVideo : undefined}
+              activeOpacity={videoUri ? 0.85 : 1}
             >
-              <Ionicons name="play" size={20} color={colors.ctaText} />
-              <Text style={styles.ctaText}>Start Analysis</Text>
+              <Ionicons name="play" size={20} color={videoUri ? colors.ctaText : colors.textMuted} />
+              <Text style={[styles.ctaText, !videoUri && styles.ctaTextDisabled]}>Start Analysis</Text>
             </TouchableOpacity>
           )}
 
@@ -393,10 +393,18 @@ const styles = StyleSheet.create({
     gap: spacing(1),
     marginBottom: spacing(2),
   },
+  ctaButtonDisabled: {
+    backgroundColor: colors.accentDim,
+    borderColor: colors.surfaceBorder,
+    opacity: 0.5,
+  },
   ctaText: {
     fontFamily: fonts.bodyBold,
     fontSize: 17,
     color: colors.ctaText,
+  },
+  ctaTextDisabled: {
+    color: colors.textMuted,
   },
 
   scoreRow: {
