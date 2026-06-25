@@ -28,7 +28,7 @@ Upload a badminton match video → fully automated scoring and analytics:
 | Player Detection | YOLOv8 standard |
 | Court Mapping | Custom line-detection pipeline (OpenCV) |
 | Scoring Engine | Python rules engine + Gemma4 LLM (for near-line calls) |
-| GPU | ROCm / AMD (WSL Ubuntu, `ubenv` virtualenv) |
+| GPU | NVIDIA CUDA (WSL Ubuntu, `ubenv` virtualenv) |
 
 ---
 
@@ -167,7 +167,10 @@ The deliberate decision was made to **not connect everything until each module w
 
 - **OS**: WSL2 (Ubuntu) on Windows
 - **Python env**: `ubenv` virtualenv with all project dependencies installed
-- **GPU**: AMD with ROCm SDK (not NVIDIA/CUDA — important for PyTorch and YOLO setup)
+- **GPU**: NVIDIA CUDA
+  - ⚠️ Current status: Driver too old (v12090), falling back to CPU
+  - To use GPU: Update NVIDIA driver to compatible version (recommended)
+  - PyTorch expects newer CUDA driver for optimal performance
 - **Backend run**: Must be started inside WSL from `backend/` directory using `uvicorn main:app`
 - **Frontend run**: `cd frontend/myApp && npx expo start`
 - **Network**: Frontend currently hardcoded to `192.168.68.73:8000` — update if IP changes

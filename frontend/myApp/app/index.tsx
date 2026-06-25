@@ -148,11 +148,12 @@ export default function HomeScreen() {
   };
 
   const chooseVideoSource = () => {
-    Alert.alert('Select Video Source', '', [
-      { text: 'Camera', onPress: recordVideo },
-      { text: 'Gallery', onPress: pickVideo },
-      { text: 'Cancel', style: 'cancel' },
-    ]);
+    const choice = prompt('Select video source:\n1 = Camera\n2 = Gallery');
+    if (choice === '1') {
+      recordVideo();
+    } else if (choice === '2') {
+      pickVideo();
+    }
   };
 
   const uploadAndProcessVideo = async () => {
