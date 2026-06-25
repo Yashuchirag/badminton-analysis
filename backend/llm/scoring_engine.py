@@ -40,6 +40,14 @@ class LandingEvent:
 
 
 @dataclass
+class PendingVerdict:
+    """Tracks the most recent uncertain verdict that may need correction."""
+    landing_event: LandingEvent
+    frame_idx: int
+    is_correctable: bool = True  # Set False after correction or if rally ends clearly
+
+
+@dataclass
 class MatchState:
     score:            list[int] = field(default_factory=lambda: [0, 0])
     serving_side:     int  = 0
@@ -48,6 +56,8 @@ class MatchState:
     rally_state:      str  = "SERVE_PENDING"  # "SERVE_PENDING" | "RALLY_ACTIVE"
     game:             int  = 1
     history:          list[LandingEvent] = field(default_factory=list)
+    pending_verdict:  Optional[PendingVerdict] = None
+    last_correction_frame: Optional[int] = None
 
 
 class ScoringEngine:
@@ -302,6 +312,14 @@ class ScoringEngine:
             return None
 
     def _start_rally(self, frame_idx: int, announce: str):
+        # Check if previous verdict needs correction
+        if (self.state.pending_verdict is not None
+                and self.state.pending_verdict.is_correctable
+                and frame_idx - self.state.pending_verdict.frame_idx > 30):  # 30 frames after verdict
+            pv = self.state.pending_verdict
+            print(f"  ⚠️  Previous verdict may be uncertain | {pv.landing_event.reason} | "
+                  f"Call engine.correct_last_verdict(Verdict.IN/OUT) if wrong")
+
         self.state.rally_state = "RALLY_ACTIVE"
         self._rally_start_frame = frame_idx
         self._launch_count = 0
@@ -374,8 +392,18 @@ class ScoringEngine:
             event.reason = (f"OUT: {abs(dist)*100:.1f}cm outside "
                             f"[{how}, {source} conf={conf:.2f}]")
 
+        # Mark verdict as potentially correctable if uncertain (near line, low confidence)
+        is_uncertain = event.near_line or conf < 0.5
+
         if event.verdict in (Verdict.IN, Verdict.OUT):
             self._update_score(event)
+            if is_uncertain:
+                # Store this verdict; next service can trigger correction
+                self.state.pending_verdict = PendingVerdict(
+                    landing_event=event,
+                    frame_idx=frame_idx,
+                    is_correctable=True
+                )
         self.state.history.append(event)
         self._reset_rally()
         self._cooldown = self._POINT_COOLDOWN
@@ -427,6 +455,59 @@ class ScoringEngine:
         self.state.game += 1
         self.state.last_hitter_side = None
         self._prev_court_x = None
+
+    def correct_last_verdict(self, new_verdict: Verdict) -> bool:
+        """
+        Correct the verdict of the most recent uncertain landing.
+        Call this when you realize the automated verdict was wrong (e.g., at next service).
+
+        Returns True if correction was applied, False if no correctable verdict exists.
+        """
+        if self.state.pending_verdict is None or not self.state.pending_verdict.is_correctable:
+            return False
+
+        old_event = self.state.pending_verdict.landing_event
+        old_verdict = old_event.verdict
+
+        if old_verdict == new_verdict:
+            # No change needed
+            self.state.pending_verdict.is_correctable = False
+            return False
+
+        # Reverse the old point
+        old_scorer_side = self._verdict_to_scorer_side(old_event, old_verdict)
+        old_scorer = self.state.side_to_player[old_scorer_side]
+        self.state.score[old_scorer] -= 1
+
+        # Award the new point
+        new_scorer_side = self._verdict_to_scorer_side(old_event, new_verdict)
+        new_scorer = self.state.side_to_player[new_scorer_side]
+        self.state.score[new_scorer] += 1
+
+        # Update the event record
+        old_event.verdict = new_verdict
+        old_event.reason = f"CORRECTED to {new_verdict.value}: {old_event.reason}"
+
+        self.state.pending_verdict.is_correctable = False
+        self.state.last_correction_frame = self._rally_start_frame
+
+        print(f"  🔄 Verdict corrected: {old_verdict.value} → {new_verdict.value} | "
+              f"score={self.state.score}")
+        return True
+
+    def _verdict_to_scorer_side(self, event: LandingEvent, verdict: Verdict) -> str:
+        """
+        Helper to determine which side scored based on landing location and verdict.
+        Mirrors logic from _update_score().
+        """
+        _opp = {"LEFT": "RIGHT", "RIGHT": "LEFT"}
+        landing_side = "LEFT" if event.court_x < 0 else "RIGHT"
+
+        if verdict == Verdict.IN:
+            return _opp[landing_side]
+        else:  # OUT
+            hitter = self.state.last_hitter_side or _opp[landing_side]
+            return _opp[hitter]
 
     # ------------------------------------------------------------------
     # Drawing
