@@ -81,6 +81,7 @@ class ScoringEngine:
     _STILL_FRAMES  = 5     # consecutive slow frames = shuttle at rest
     _GONE_FRAMES   = 10    # frames with no detection after a descending low ball
     _ABORT_FRAMES  = 150   # no detections at all → abort rally, no point
+    _DESCENDING_THRESHOLD = 1.5  # px/frame, clearly descending velocity (not peak lobs)
 
     # ── After a point: ignore the shuttle being picked up / walked back ──────
     _POINT_COOLDOWN = 75   # frames
@@ -262,12 +263,12 @@ class ScoringEngine:
                 return self._finish_rally(frame_idx, pos[0], pos[1], conf, source,
                                           how="came to rest")
 
-        # ── Rally end B: vanished while descending near the floor ────────────
+        # ── Rally end B: vanished while clearly descending near the floor ────────────
         if pos is None and self._last_det is not None:
             lf, lx, ly, lconf, lsrc, lvy = self._last_det
             if (frame_idx - lf >= self._GONE_FRAMES
                     and self._is_low(ly)
-                    and lvy >= 0):
+                    and lvy >= self._DESCENDING_THRESHOLD):
                 return self._finish_rally(frame_idx, lx, ly, lconf, lsrc,
                                           how="vanished while descending")
 
