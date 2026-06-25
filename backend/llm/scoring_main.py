@@ -39,6 +39,16 @@ total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
 frame_idx = 0
 t_start = time.time()
 
+# ── Optional: Correction callback ─────────────────────────────────
+# If engine detects an uncertain verdict, you can correct it here
+def on_next_service():
+    """Called when next service starts after uncertain verdict."""
+    if engine.state.pending_verdict is not None:
+        print("\n  💡 Tip: Previous verdict was uncertain. Call:")
+        print("     engine.correct_last_verdict(Verdict.OUT)  # if it should be OUT")
+        print("     or")
+        print("     engine.correct_last_verdict(Verdict.IN)   # if it should be IN")
+
 try:
     while True:
         ret, frame = cap.read()
@@ -52,6 +62,12 @@ try:
 
         landing = engine.process_frame(frame, frame_idx)
         score   = engine.state.score
+
+        # Check if previous verdict needs correction at next service
+        if (engine.state.rally_state == "RALLY_ACTIVE"
+                and frame_idx > 0
+                and engine.state.pending_verdict is not None):
+            on_next_service()
 
         # ── Court boundary overlay ────────────────────────────────────────
         frame = engine.draw_court_boundaries(frame)
