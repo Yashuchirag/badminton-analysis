@@ -88,7 +88,7 @@ game-tracker/
 - Uploads video as `multipart/form-data` to `POST /track-human-video-async`
 - Polls `GET /job-status/{jobId}` every 500ms for live progress
 - Shows: frame count, % complete, live preview image, people count, shuttle detection status
-- **Known issue**: Backend IP is hardcoded to `192.168.68.73:8000` (local network only)
+- Backend URL comes from `EXPO_PUBLIC_API_URL` (default `http://localhost:8001`, see `lib/config.ts`); port 8000 is reserved for the local LLM server
 - **Planned change**: Instead of uploading raw video directly to the endpoint, upload to a database/storage bucket first; backend then reads from storage. This is more efficient for long videos.
 
 ### Backend API (`backend/main.py`)
@@ -173,4 +173,4 @@ The deliberate decision was made to **not connect everything until each module w
   - PyTorch expects newer CUDA driver for optimal performance
 - **Backend run**: Must be started inside WSL from `backend/` directory using `uvicorn main:app`
 - **Frontend run**: `cd frontend/myApp && npx expo start`
-- **Network**: Frontend currently hardcoded to `192.168.68.73:8000` — update if IP changes
+- **Network**: Set `EXPO_PUBLIC_API_URL=http://<LAN-IP>:8001` when testing on a physical phone; the default is `http://localhost:8001`

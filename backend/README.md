@@ -45,7 +45,7 @@ not part of this repo.
 ## Running the API
 
 ```bash
-uvicorn main:app --host 0.0.0.0 --port 8000 --reload
+uvicorn main:app --host 0.0.0.0 --port 8001 --reload
 ```
 
 `DETECT_STRIDE` (env var, default `2`) controls how often shuttle inference

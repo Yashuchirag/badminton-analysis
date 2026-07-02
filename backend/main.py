@@ -241,4 +241,4 @@ async def live_ws(websocket: WebSocket, session_id: str):
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run("main:app", host="0.0.0.0", port=int(os.environ.get("PORT", "4000")))
+    uvicorn.run("main:app", host="0.0.0.0", port=int(os.environ.get("PORT", "8001")))
