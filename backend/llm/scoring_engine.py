@@ -45,6 +45,8 @@ class PendingVerdict:
     landing_event: LandingEvent
     frame_idx: int
     is_correctable: bool = True  # Set False after correction or if rally ends clearly
+    game_number: int = 1                     # game this verdict belongs to
+    hitter_side: Optional[str] = None        # last_hitter_side when the shuttle landed
 
 
 @dataclass
@@ -396,13 +398,19 @@ class ScoringEngine:
         is_uncertain = event.near_line or conf < 0.5
 
         if event.verdict in (Verdict.IN, Verdict.OUT):
+            # Capture before _update_score: a game-deciding point advances
+            # state.game and clears last_hitter_side inside _game_over.
+            game_number = self.state.game
+            hitter_side = self.state.last_hitter_side
             self._update_score(event)
             if is_uncertain:
                 # Store this verdict; next service can trigger correction
                 self.state.pending_verdict = PendingVerdict(
                     landing_event=event,
                     frame_idx=frame_idx,
-                    is_correctable=True
+                    is_correctable=True,
+                    game_number=game_number,
+                    hitter_side=hitter_side,
                 )
         self.state.history.append(event)
         self._reset_rally()
@@ -455,6 +463,11 @@ class ScoringEngine:
         self.state.game += 1
         self.state.last_hitter_side = None
         self._prev_court_x = None
+        # Players switch ends between games; the player tracker re-confirms
+        # this from live detections every few frames.
+        left_player = self.state.side_to_player["LEFT"]
+        right_player = self.state.side_to_player["RIGHT"]
+        self.state.side_to_player = {"LEFT": right_player, "RIGHT": left_player}
 
     def correct_last_verdict(self, new_verdict: Verdict) -> bool:
         """
@@ -466,6 +479,12 @@ class ScoringEngine:
         if self.state.pending_verdict is None or not self.state.pending_verdict.is_correctable:
             return False
 
+        # Corrections cannot cross game boundaries: the score they would
+        # adjust was reset when the game ended.
+        if self.state.pending_verdict.game_number < self.state.game:
+            self.state.pending_verdict.is_correctable = False
+            return False
+
         old_event = self.state.pending_verdict.landing_event
         old_verdict = old_event.verdict
 
@@ -474,13 +493,17 @@ class ScoringEngine:
             self.state.pending_verdict.is_correctable = False
             return False
 
+        # Use the hitter recorded at landing time — last_hitter_side may
+        # already belong to the next rally when the correction arrives.
+        hitter_side = self.state.pending_verdict.hitter_side
+
         # Reverse the old point
-        old_scorer_side = self._verdict_to_scorer_side(old_event, old_verdict)
+        old_scorer_side = self._verdict_to_scorer_side(old_event, old_verdict, hitter_side)
         old_scorer = self.state.side_to_player[old_scorer_side]
         self.state.score[old_scorer] -= 1
 
         # Award the new point
-        new_scorer_side = self._verdict_to_scorer_side(old_event, new_verdict)
+        new_scorer_side = self._verdict_to_scorer_side(old_event, new_verdict, hitter_side)
         new_scorer = self.state.side_to_player[new_scorer_side]
         self.state.score[new_scorer] += 1
 
@@ -495,7 +518,8 @@ class ScoringEngine:
               f"score={self.state.score}")
         return True
 
-    def _verdict_to_scorer_side(self, event: LandingEvent, verdict: Verdict) -> str:
+    def _verdict_to_scorer_side(self, event: LandingEvent, verdict: Verdict,
+                                hitter_side: Optional[str] = None) -> str:
         """
         Helper to determine which side scored based on landing location and verdict.
         Mirrors logic from _update_score().
@@ -506,7 +530,7 @@ class ScoringEngine:
         if verdict == Verdict.IN:
             return _opp[landing_side]
         else:  # OUT
-            hitter = self.state.last_hitter_side or _opp[landing_side]
+            hitter = hitter_side or self.state.last_hitter_side or _opp[landing_side]
             return _opp[hitter]
 
     # ------------------------------------------------------------------

@@ -302,10 +302,17 @@ def active_live_sessions() -> int:
 
 
 def active_sessions() -> int:
-    """Sessions still holding an engine (any mode). VRAM allows one at a time."""
+    """Sessions still holding an engine (any mode). VRAM allows one at a time.
+
+    A session is only inactive once BOTH signals agree: the worker has
+    released the engine AND set a terminal status. Checking the engine alone
+    would miss sessions still loading models (engine not yet assigned), and
+    checking the status alone can lag behind the engine release.
+    """
     return sum(
         1 for s in SESSIONS.values()
-        if s.latest_state["status"] not in ("complete", "error")
+        if s.engine is not None
+        or s.latest_state["status"] not in ("complete", "error")
     )
 
 

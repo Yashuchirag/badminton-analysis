@@ -101,8 +101,94 @@ def test_verdict_correction_updates_score():
     print("✓ test_verdict_correction_updates_score passed")
 
 
+def test_side_switch_after_game_over():
+    """Players switch ends after a game, so side_to_player must flip."""
+    engine = ScoringEngine(mode="singles", device="cpu")
+    engine.state.score = [20, 15]
+    engine.state.side_to_player = {"LEFT": 0, "RIGHT": 1}
+
+    engine._game_over(winner=0)
+
+    assert engine.state.game == 2, "Game counter should advance"
+    assert engine.state.score == [0, 0], "Score should reset"
+    assert engine.state.side_to_player == {"LEFT": 1, "RIGHT": 0}, \
+        "Side mapping should flip after game over"
+    print("✓ test_side_switch_after_game_over passed")
+
+
+def test_correction_rejected_across_games():
+    """A pending verdict from a finished game must not alter the next game's score."""
+    engine = ScoringEngine(mode="singles", device="cpu")
+
+    landing = LandingEvent(
+        frame_idx=100,
+        pixel_x=320, pixel_y=450,
+        court_x=0.5, court_y=2.0,
+        confidence=0.45,
+        source="yolo",
+        near_line=True,
+        verdict=Verdict.IN,
+        reason="IN (near-line, low conf) — may be wrong"
+    )
+    engine.state.pending_verdict = PendingVerdict(
+        landing_event=landing,
+        frame_idx=100,
+        is_correctable=True,
+        game_number=1
+    )
+    engine.state.game = 2
+    engine.state.score = [1, 1]
+
+    success = engine.correct_last_verdict(Verdict.OUT)
+
+    assert success is False, "Correction across games should be rejected"
+    assert engine.state.score == [1, 1], "Score of the new game must be untouched"
+    assert engine.state.pending_verdict.is_correctable is False, \
+        "Stale verdict should be marked non-correctable"
+    print("✓ test_correction_rejected_across_games passed")
+
+
+def test_correction_uses_hitter_at_landing_time():
+    """OUT correction must use the hitter recorded at landing, not the current rally's."""
+    engine = ScoringEngine(mode="singles", device="cpu")
+    engine.state.score = [10, 9]
+
+    # Uncertain IN on the RIGHT half; the LEFT player hit it there.
+    landing = LandingEvent(
+        frame_idx=100,
+        pixel_x=320, pixel_y=450,
+        court_x=0.5, court_y=2.0,
+        confidence=0.45,
+        source="yolo",
+        near_line=True,
+        verdict=Verdict.IN,
+        reason="IN (near-line, low conf) — may be wrong"
+    )
+    engine.state.pending_verdict = PendingVerdict(
+        landing_event=landing,
+        frame_idx=100,
+        is_correctable=True,
+        game_number=1,
+        hitter_side="LEFT"
+    )
+    # A new rally has started meanwhile and the RIGHT player hit last.
+    engine.state.last_hitter_side = "RIGHT"
+
+    success = engine.correct_last_verdict(Verdict.OUT)
+
+    # IN gave the point to LEFT (player 0); OUT by the LEFT hitter gives it
+    # to RIGHT (player 1): [10, 9] → [9, 10].
+    assert success is True, "Correction should succeed"
+    assert engine.state.score == [9, 10], \
+        "Correction should score against the recorded hitter, not the current one"
+    print("✓ test_correction_uses_hitter_at_landing_time passed")
+
+
 if __name__ == "__main__":
     test_high_lob_does_not_end_rally()
     test_descending_shuttle_ends_rally()
     test_verdict_correction_updates_score()
+    test_side_switch_after_game_over()
+    test_correction_rejected_across_games()
+    test_correction_uses_hitter_at_landing_time()
     print("✓ All tests passed")
