@@ -423,6 +423,7 @@ class ShuttleTracker:
             print(f"✓ Loaded TrackNet: {tracknet_weights}")
         
         self.frame_buffer = deque(maxlen=3)  # For TrackNet multi-frame input
+        self._obb_pad = 0  # largest batch seen by predict_window, see below
 
     def predict_frame(
             self,
@@ -497,6 +498,137 @@ class ShuttleTracker:
         conf = float(yolo_conf) if yolo_pos else (0.7 if tracknet_pos else 0.0)
         src  = "hybrid" if pos else "none"
         return pos, conf, src
+
+    def predict_window(
+            self,
+            frames: list,
+            indices: list,
+            mode: str = "hybrid",
+            conf_threshold: float = 0.25,
+            yolo_conf_skip_tracknet: float = 0.65,
+    ) -> dict:
+        """
+        Batched predict_frame over a window of consecutive frames.
+
+        frames  – every frame of the window in order (TrackNet stacks need the
+                  in-between frames too)
+        indices – window positions that need a detection
+
+        Returns {index: (pos, conf, source)} with predict_frame semantics.
+        frame_buffer supplies the cross-window context so TrackNet stacks stay
+        contiguous, and is left holding the window's trailing frames.
+        """
+        h, w = frames[0].shape[:2]
+        use_half = "cuda" in self.device and self.use_fp16
+        sx = w / INFERENCE_SIZE
+        sy = h / INFERENCE_SIZE
+
+        def _scale(pos):
+            return (pos[0] * sx, pos[1] * sy) if pos is not None else None
+
+        ctx = list(self.frame_buffer)[-2:]   # predecessors of frames[0]
+
+        if mode == "yolo":
+            model, is_obb = self.yolo_model, False
+        elif mode == "obb":
+            model, is_obb = self.obb_model, True
+        elif mode == "tracknet":
+            model, is_obb = None, False
+        else:  # hybrid
+            model = self.obb_model if self.obb_model is not None else self.yolo_model
+            is_obb = self.obb_model is not None
+        src_det = "obb" if is_obb else "yolo"
+
+        yolo_res = {i: (None, 0.0) for i in indices}
+        if model is not None and indices:
+            infers = [cv2.resize(frames[i], (INFERENCE_SIZE, INFERENCE_SIZE))
+                      for i in indices]
+            # cuDNN builds fp16 conv plans per batch shape (seconds each on
+            # this box), so pad short tail batches up to the largest batch
+            # seen and let zip() drop the extra results.
+            self._obb_pad = max(self._obb_pad, len(infers))
+            infers += [infers[-1]] * (self._obb_pad - len(infers))
+            results = model(infers, conf=conf_threshold, verbose=False,
+                            half=use_half)
+            for i, r in zip(indices, results):
+                pos, conf = self._extract_box_with_conf(r, is_obb=is_obb)
+                yolo_res[i] = (_scale(pos), float(conf))
+
+        # ── TrackNet, one forward for every frame that needs the fallback ──
+        need = []
+        if self.tracknet_model is not None:
+            if mode == "tracknet":
+                need = list(indices)
+            elif mode not in ("yolo", "obb"):
+                need = [i for i in indices
+                        if yolo_res[i][1] < yolo_conf_skip_tracknet]
+
+        tn_pos = {}
+        all_frames = ctx + list(frames)
+        p = len(ctx)
+        rgb_cache = {}
+
+        def _rgb(j):
+            if j not in rgb_cache:
+                img = cv2.resize(all_frames[j], (TRACKNET_SIZE, TRACKNET_SIZE))
+                rgb_cache[j] = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+            return rgb_cache[j]
+
+        stacks, owners = [], []
+        for i in need:
+            if i + p < 2:
+                tn_pos[i] = None   # video start: fewer than 3 frames of history
+                continue
+            imgs = [_rgb(j) for j in range(i + p - 2, i + p + 1)]
+            stacks.append(np.array(imgs).transpose(0, 3, 1, 2))
+            owners.append(i)
+
+        if stacks:
+            arr = np.stack(stacks).astype(np.float32) / 255.0
+            tensor = torch.from_numpy(arr)
+            if "cuda" in self.device:
+                tensor = tensor.pin_memory().to(self.device, non_blocking=True)
+                if self.use_fp16:
+                    tensor = tensor.half()
+            else:
+                tensor = tensor.to(self.device)
+            with torch.no_grad():
+                heatmaps = self.tracknet_model(tensor).cpu().float().numpy()
+            for i, hm in zip(owners, heatmaps):
+                y_max, x_max = np.unravel_index(hm.argmax(), hm.shape)
+                if hm[y_max, x_max] > 0.5:
+                    tn_pos[i] = (x_max * w / TRACKNET_SIZE,
+                                 y_max * h / TRACKNET_SIZE)
+                else:
+                    tn_pos[i] = None
+
+        # ── Fusion, identical to predict_frame's tail ─────────────────────
+        out = {}
+        for i in indices:
+            yolo_pos, yolo_conf = yolo_res[i]
+            if mode == "tracknet":
+                pos = tn_pos.get(i)
+                out[i] = (pos, 0.7 if pos is not None else 0.0, "tracknet")
+                continue
+            if (mode in ("yolo", "obb")
+                    or yolo_conf >= yolo_conf_skip_tracknet
+                    or self.tracknet_model is None):
+                out[i] = (yolo_pos, float(yolo_conf), src_det)
+                continue
+            tracknet_pos = tn_pos.get(i)
+            if yolo_pos and tracknet_pos:
+                dist = np.hypot(yolo_pos[0] - tracknet_pos[0],
+                                yolo_pos[1] - tracknet_pos[1])
+                pos = tracknet_pos if dist < 50 else yolo_pos
+                out[i] = (pos, float(yolo_conf), "hybrid")
+            else:
+                pos = yolo_pos or tracknet_pos
+                conf = float(yolo_conf) if yolo_pos else (0.7 if tracknet_pos else 0.0)
+                out[i] = (pos, conf, "hybrid" if pos else "none")
+
+        for f in frames[-3:]:
+            self.frame_buffer.append(f.copy())
+        return out
 
     def track_video(self, video_path: str, output_path: str,
                     mode: str = "hybrid", conf_threshold: float = 0.25,

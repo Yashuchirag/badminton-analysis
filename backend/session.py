@@ -21,6 +21,7 @@ import cv2
 from llm.scoring_engine import ScoringEngine
 
 CHUNK_FRAME_PAD = 9     # one past ScoringEngine._HIT_GAP_MAX
+BATCH_WINDOW = 32       # frames per batched GPU detection call (16 at stride 2)
 SESSION_TTL = 600       # seconds of inactivity before a session is evicted
 
 SESSIONS: Dict[str, "ChunkSession"] = {}
@@ -163,31 +164,43 @@ class ChunkSession:
         self._set_state(status="processing")
 
         while True:
-            ret, frame = cap.read()
-            if not ret:
+            window = []
+            while len(window) < BATCH_WINDOW:
+                ret, frame = cap.read()
+                if not ret:
+                    break
+                window.append(frame)
+            if not window:
                 break
-            event = self.engine.process_frame(frame, self.global_frame_idx)
-            if event is not None:
-                self.landing_events.append({
-                    "frame": event.frame_idx,
-                    "verdict": event.verdict.value,
-                    "court_x": round(event.court_x, 3),
-                    "court_y": round(event.court_y, 3),
-                    "confidence": round(event.confidence, 3),
-                    "source": event.source,
-                    "reason": event.reason,
-                })
-            if self.annotate:
-                self._enqueue_annotated(frame)
-            self.global_frame_idx += 1
-            self.latest_state["frame"] += 1
-            self.latest_state["score"] = list(self.engine.state.score)
-            self.latest_state["rally_state"] = self.engine.state.rally_state
-            self.latest_state["last_hitter_side"] = self.engine.state.last_hitter_side
-            if self.expected_total_frames:
-                self.latest_state["progress_percent"] = round(
-                    self.latest_state["frame"] / self.expected_total_frames * 100, 1
+            dets = self.engine.precompute_detections(window, self.global_frame_idx)
+            for frame in window:
+                event = self.engine.process_frame(
+                    frame, self.global_frame_idx,
+                    det=dets.get(self.global_frame_idx),
                 )
+                if event is not None:
+                    self.landing_events.append({
+                        "frame": event.frame_idx,
+                        "verdict": event.verdict.value,
+                        "court_x": round(event.court_x, 3),
+                        "court_y": round(event.court_y, 3),
+                        "confidence": round(event.confidence, 3),
+                        "source": event.source,
+                        "reason": event.reason,
+                    })
+                if self.annotate:
+                    self._enqueue_annotated(frame)
+                self.global_frame_idx += 1
+                self.latest_state["frame"] += 1
+                self.latest_state["score"] = list(self.engine.state.score)
+                self.latest_state["rally_state"] = self.engine.state.rally_state
+                self.latest_state["last_hitter_side"] = self.engine.state.last_hitter_side
+                if self.expected_total_frames:
+                    self.latest_state["progress_percent"] = round(
+                        self.latest_state["frame"] / self.expected_total_frames * 100, 1
+                    )
+            if len(window) < BATCH_WINDOW:
+                break
 
         cap.release()
         os.remove(path)

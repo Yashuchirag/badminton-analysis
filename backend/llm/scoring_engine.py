@@ -145,6 +145,7 @@ class ScoringEngine:
         self._last_hit_frame = -10**9
         self._rally_start_frame = 0
         self._cooldown = 0
+        self._batched = False  # precompute_detections owns the tracker frame_buffer
 
     def auto_calibrate(self, video_path: str, n_frames: int = 90,
                        debug: bool = False) -> list:
@@ -180,7 +181,33 @@ class ScoringEngine:
 
         return result.refined_corners.tolist() if result.refined_corners is not None else []
 
-    def process_frame(self, frame, frame_idx: int) -> Optional[LandingEvent]:
+    def precompute_detections(self, frames: list, first_frame_idx: int) -> dict:
+        """
+        Batched shuttle detection for a window of consecutive frames.
+
+        Returns {frame_idx: (pos, conf, source)} for the stride frames; pass
+        each entry to process_frame(det=...) so the sequential state machine
+        consumes them in order without per-frame GPU calls.
+        """
+        self._batched = True
+        if self._cooldown >= len(frames):
+            # Whole window sits inside post-point cooldown: no frame will
+            # consult a detection, but keep TrackNet context contiguous.
+            for f in frames[-3:]:
+                self.tracker.frame_buffer.append(f.copy())
+            return {}
+        stride_pos = [k for k in range(len(frames))
+                      if (first_frame_idx + k) % self.detect_stride == 0]
+        window_dets = self.tracker.predict_window(
+            frames, stride_pos,
+            mode=self.tracking_mode,
+            conf_threshold=self.conf_threshold,
+            yolo_conf_skip_tracknet=self.yolo_conf_skip_tracknet,
+        )
+        return {first_frame_idx + k: window_dets[k] for k in stride_pos}
+
+    def process_frame(self, frame, frame_idx: int,
+                      det: Optional[tuple] = None) -> Optional[LandingEvent]:
         self._frame_height = frame.shape[0]
         self.last_shuttle = None
 
@@ -197,7 +224,8 @@ class ScoringEngine:
         if self.detect_stride > 1 and frame_idx % self.detect_stride != 0:
             if self._cooldown > 0:
                 self._cooldown -= 1
-            self.tracker.frame_buffer.append(frame.copy())
+            if not self._batched:
+                self.tracker.frame_buffer.append(frame.copy())
             if len(self._traj) >= 2:
                 (t0, x0, y0), (t1, x1, y1) = list(self._traj)[-2:]
                 gap = t1 - t0
@@ -213,7 +241,7 @@ class ScoringEngine:
             self._cooldown -= 1
             return None
 
-        pos, conf, source = self.tracker.predict_frame(
+        pos, conf, source = det if det is not None else self.tracker.predict_frame(
             frame,
             mode=self.tracking_mode,
             conf_threshold=self.conf_threshold,
