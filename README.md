@@ -4,202 +4,154 @@
 
 <video src="https://github.com/user-attachments/assets/9782b5b1-93be-4ccd-8e7e-540d336c683b" width="100%" controls></video>
 
-An **Expo + React Native** mobile application that takes **badminton match videos** as input and produces **automated scoring and analytics** using computer vision and machine learning.
-
-This project aims to bridge **sports + software + AI**, focusing on offline/online video processing to detect rallies, shots, player actions, and scoring events in badminton matches.
+An **Expo + React Native** app paired with a **FastAPI** backend that takes a badminton match video, whether uploaded from a phone or streamed live from the camera, and returns an automated score, rally history, and an annotated output video. Detection and scoring run entirely on computer vision and geometry; no LLM is involved in the scoring path.
 
 ---
 
 ## 🚀 Vision
 
-Badminton scoring is fast-paced and difficult to track manually. This app aims to:
+Badminton scoring is fast-paced and difficult to track manually. This app:
 
-- Accept **video input** (recorded or uploaded)
-- Analyze gameplay using **computer vision models**
-- Automatically **detect shots, rallies, and points**
-- Generate **match scores, statistics, and insights**
-- Serve as a foundation for advanced analytics (player performance, shot types, heatmaps)
-
----
-
-## ✨ Key Features (Planned & In Progress)
-
-### 📹 Video Input
-
-- Upload video from device gallery / Record video directly inside the app
-
-### 🧠 AI-Powered Analysis
-
-- Shuttle detection & tracking (TrackNet and YOLO-based)
-- Rally segmentation
-
-### 🧮 Scoring Engine
-
-- Automatic point detection
-- Rally-based score updates
-- Match progression tracking
-- Support for singles & doubles (future)
-
-### 📊 Output & Insights
-
-- Player movement analysis
-- Shuttle tracking
-- Rally count & duration (future)
-- Shot distribution (future)
-- Final match score (future)
+- Accepts **video input**, either a recorded upload or a live phone camera feed
+- Auto-detects the **court** from a static-camera video and calibrates a homography to it
+- Tracks the **shuttle** frame by frame and detects hits, rallies, and landings
+- Judges **IN/OUT** verdicts geometrically and drives a real scoring state machine
+- Returns the **match score, rally history, and an annotated video** back to the app
 
 ---
 
 ## 🧱 Tech Stack
 
-### Frontend (This Repository)
+### Frontend (`frontend/myApp`)
 
-- **Expo (SDK 54)**
-- **React Native**
-- **Expo Router**
-- **TypeScript**
-- **Expo Video Picker** – video selection
-- **Expo Video Player** – video playback
+- **Expo (SDK 54)**, **React Native**, **Expo Router**, **TypeScript**
+- Video capture and gallery picking via `expo-camera` / `expo-image-picker`
+- Playback via `expo-av`
+- Two flows: upload-and-analyze (`app/index.tsx`) and live scoring (`app/live.tsx`)
 
-### Backend / ML (Separate Service)
+### Backend (`backend`)
 
-- **FastAPI** (Python)
-- **OpenCV** for video frame processing
-- **YOLOv11** – player & shuttle detection
-- **TrackNet** – shuttle tracking
-
-> ⚠️ This repository focuses on the **mobile application layer**. The ML pipeline runs as a separate backend service.
+- **FastAPI** serving upload and live-streaming endpoints
+- **OpenCV** for frame processing
+- **YOLOv8/YOLOv11 (standard + OBB)** and **TrackNetV2** fused for shuttle tracking
+- **YOLO** for lightweight player tracking
+- A hand-written **scoring engine** (state machine, no ML) that turns shuttle trajectory into hits, rallies, and points
 
 ---
 
 ## 📁 Project Structure
 
 ```text
-app/
- ├── index.tsx        # Home screen
- ├── _layout.tsx          # App layout & routing
+frontend/myApp/
+ ├── app/
+ │   ├── index.tsx        # Upload/record a video, poll job status, view results
+ │   ├── live.tsx          # Live camera capture, chunked upload, WebSocket score updates
+ │   └── _layout.tsx
+ ├── components/
+ │   └── ShuttleBackground.tsx   # Animated interactive background
+ ├── lib/
+ │   ├── config.ts         # API base URL
+ │   ├── theme.ts
+ │   └── videoForm.ts      # Cross-platform multipart upload helper (web vs. native)
+ └── assets/
 
-components/
- ├── ThemedView.tsx
- ├── ThemedText.tsx
-
-assets/
- ├── images/
-
-scripts/
- └── reset-project.js
-
-package.json
-app.json
-README.md
+backend/
+ ├── main.py               # FastAPI app: upload, processing, live endpoints
+ ├── session.py             # ChunkSession: per-session engine + live worker thread
+ ├── court_mapping/         # Auto court-corner detection + homography (see its README)
+ ├── model2/                # TrackNetV2 + YOLO training/tracking pipeline
+ └── llm/
+     ├── scoring_engine.py   # Core scoring state machine
+     ├── player_tracker.py
+     ├── scoring_main.py     # Standalone scoring script (no API)
+     └── integrated_main.py  # Standalone scoring + shuttle trail overlay demo
 ```
 
 ---
 
 ## 🛠️ Installation & Setup
 
-### 1️⃣ Prerequisites
-
-- Node.js (>= 18 recommended)
-- npm or yarn
-- Expo CLI (local)
+### Frontend
 
 ```bash
-npm install -g expo
-```
-
----
-
-### 2️⃣ Install Dependencies
-
-```bash
+cd frontend/myApp
 npm install
+npm start          # then press a / i / w, or scan the QR code
 ```
 
----
-
-### 3️⃣ Start the App
+### Backend
 
 ```bash
-npm start
+cd backend
+python -m venv ubenv
+./ubenv/bin/pip install -r requirements.txt
+
+# PyTorch with CUDA isn't pinned in requirements.txt, install separately:
+./ubenv/bin/pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121
+
+uvicorn main:app --host 0.0.0.0 --port 8001 --reload
 ```
 
-Run on specific platforms:
-
-```bash
-npm run android
-npm run ios
-npm run web
-```
+Model weights (`model2/models/`, `yolo*.pt`, `*.pth`) and datasets are gitignored and expected to exist locally. See `backend/README.md` for the full setup, endpoint reference, and training/tracking CLI.
 
 ---
 
-## 📱 How the App Works (High Level)
+## 📱 How the App Works
 
-1. User selects a **badminton match video**
-2. Video is uploaded to the backend API
-3. Backend:
-   - Extracts frames
-   - Detects players & shuttle
-   - Tracks rallies & shots
-   - Computes score logic
+**Upload flow:**
 
-4. Processed results are returned to the app
-5. App displays:
-   - Match score
-   - Rally stats
-   - Visual summaries
+1. User records or picks a video from the gallery.
+2. The app uploads it to `POST /upload-video`, then triggers `POST /process-video/{job_id}`.
+3. The backend calibrates the court once, then tracks the shuttle and players frame by frame, scoring as it goes.
+4. The app polls `GET /job-status/{job_id}` for progress, then fetches `GET /results/{job_id}` and the annotated video from `GET /download/{job_id}`.
 
----
+**Live flow:**
 
-## 🔌 Backend API (Planned Interface)
+1. `POST /live/start` opens a session and returns a `session_id`.
+2. The phone records short chunks and uploads each via `POST /live/chunk/{session_id}`.
+3. The backend processes chunks in sequence on a worker thread, carrying score and trajectory state across chunks.
+4. The app subscribes to `WS /live/ws/{session_id}` (or polls `GET /live/status/{session_id}`) for live score updates.
+5. `POST /live/finish/{session_id}` signals the end of the stream.
 
-Example:
-
-```http
-POST /analyze-video
-Content-Type: multipart/form-data
-
-video=<match.mp4>
-```
-
-Response:
-
-```
-Video
-```
-
----
-
-## 🧠 ML Roadmap
-
-- [ ] Shuttle detection with TrackNet
-- [ ] Player pose estimation (YOLOv11-Pose)
-- [ ] Shot classification using temporal models
-- [ ] Rally segmentation logic
-- [ ] Robust scoring rules for badminton
-- [ ] Offline video processing support
+Only one video (upload or live) is processed at a time; a second request while one is active gets `409 Conflict`, since a single GPU backs the whole service.
 
 ---
 
 ## 🧪 Current Status
 
-🚧 **Work in Progress**
+### ✅ Done
 
-- App scaffolding complete
-- Video picker integration completed
-- Backend experimentation with YOLO & TrackNet completed
-- Court mapping pending
-- Shot detection pending
-- Rally segmentation pending
-- Scoring logic pending
+- Court auto-detection from a static-camera video, fitted homography to the canonical court (`court_mapping/`)
+- Hybrid shuttle tracking (YOLO + YOLO-OBB + TrackNetV2), batched over 32-frame windows for throughput (12 → 35 fps)
+- Player tracking (lightweight YOLO, sampled every N frames)
+- Scoring engine: serve detection, hit detection, rally-end detection, IN/OUT verdicts, 21-point rules with deuce and game transitions
+- Side switch between games, cross-game verdict corrections, and a race-safe active-session count (previously buggy, now fixed)
+- Verdict-correction logic in the scoring engine (`correct_last_verdict`), covered by tests, though not yet wired to a REST endpoint
+- FastAPI backend: upload/process/poll/download flow, plus a chunked live-streaming flow with WebSocket updates
+- Frontend: recording, gallery picking, upload progress, results playback, live scoring screen
+- Cross-platform multipart upload helper (`lib/videoForm.ts`) fixing a web/native `FormData` mismatch
+- H.264 transcode step on session finalize, so result videos actually play back in the browser
+- Test suites for the scoring engine and the FastAPI app (see `backend/README.md` → Tests, and `E2E_TEST_REPORT.md`)
+
+### ⚠️ Known issues (see `E2E_TEST_REPORT.md` for detail)
+
+- Hit detection has no floor/height gate, so a landing impact can be misread as a racket hit, occasionally misattributing OUT points
+- Live throughput still trails real time on CPU-bound setups; a dropped chunk can stall live scoring until `finish` is called
+- Service-court rules (left/right box by score parity, faults) aren't modeled
+- `mode` (singles/doubles) isn't sent from the upload screen, so scoring always runs in singles mode
+
+### 🚧 Pending
+
+- Shot classification / shot-type breakdown
+- Player performance analytics, heatmaps
+- Doubles-aware scoring end to end (the engine supports it; the frontend doesn't send it yet)
 
 ---
 
 ## 🌱 Future Enhancements
 
-- Real-time scoring
-- Match replay with overlays
+- Real-time scoring at full camera frame rate
+- Match replay with shot/rally overlays
 - Player comparison dashboards
 - Coach & training mode
 
